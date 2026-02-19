@@ -48,6 +48,11 @@ const Version = enum {
     @"HTTP/2.0",
 };
 
+const Connection = enum {
+    close,
+    @"keep-alive",
+};
+
 const Header = struct {
     key: []const u8,
     value: []const u8,
@@ -59,15 +64,28 @@ const Request = struct {
     version: Version,
     headers: std.ArrayList(Header),
     body: ?std.ArrayList(u8),
+    connection: Connection,
 
     const ParseError = error{
+        /// Content-Length is not a number
+        HeaderContentLen,
+        /// Connection header is not valid
+        HeaderConnection,
+        /// Header cannot be parsed
         BadHeader,
+        /// Missing \r\n\r\n at end of header
         MissingCRLFCRLF,
+        /// We blew up
         Internal,
+        /// Method we dont implement
         Method,
+        /// Version we dont implement
         Version,
+        /// Generic bad request
         Bad,
+        /// Content larger than Content-Length
         ContentTooLarge,
+        /// Server only accepts Smaller Content-Length's
         MaxContentLenExceeded,
     } || std.mem.Allocator.Error || std.Io.Reader.Error;
 
@@ -79,6 +97,13 @@ const Request = struct {
 
     inline fn content_len(self: *@This()) usize {
         if (self.body != null) return self.body.?.capacity else return 0;
+    }
+
+    inline fn keepAlive(self: *@This()) bool {
+        return switch (self.connection) {
+            Connection.@"keep-alive" => true,
+            Connection.close => false,
+        };
     }
 
     fn parse(arena: std.mem.Allocator, reader: *std.io.Reader) ParseError!@This() {
@@ -100,7 +125,9 @@ const Request = struct {
         const version = stringToEnum(Version, version_str) orelse return ParseError.Version;
 
         var headers = std.ArrayList(Header).initCapacity(arena, 32) catch return ParseError.Internal;
+
         var maybe_content_ln: ?u64 = null;
+        var connection: Connection = if (version == Version.@"HTTP/1.1") Connection.@"keep-alive" else Connection.close;
         while (headers_parts.next()) |header| {
             var header_parts = splitSequence(u8, header, ": ");
 
@@ -111,9 +138,14 @@ const Request = struct {
             const key_lower = try std.ascii.allocLowerString(arena, key);
 
             if (std.mem.eql(u8, key_lower, "content-length")) {
-                maybe_content_ln = std.fmt.parseInt(u64, value, 10) catch return ParseError.BadHeader;
+                maybe_content_ln = std.fmt.parseInt(u64, value, 10) catch return ParseError.HeaderContentLen;
 
                 if (maybe_content_ln.? > MAX_CONTENT_LEN) return ParseError.MaxContentLenExceeded;
+                continue;
+            }
+            if (std.mem.eql(u8, key_lower, "connection")) {
+                connection = stringToEnum(Connection, value) orelse return ParseError.HeaderConnection;
+                continue;
             }
 
             try headers.append(arena, .{
@@ -136,6 +168,7 @@ const Request = struct {
             .version = version,
             .headers = headers,
             .body = body,
+            .connection = connection,
         };
     }
 
@@ -177,43 +210,6 @@ fn pinToCore(core: u16) !void {
     }
 }
 
-fn worker(id: u16) !void {
-    log.info("Starting worker {}", .{id});
-
-    // Prevent allocating to a core we dont have
-    const max_cores = try std.Thread.getCpuCount();
-    try pinToCore(@intCast(id % max_cores));
-
-    var allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const arena = allocator.allocator();
-
-    const address = net.Address.initIp6([_]u8{0} ** 16, 8080, 0, 0);
-    const options = net.Address.ListenOptions{ .reuse_address = true };
-
-    var listener = try address.listen(options);
-    defer listener.deinit();
-
-    const timeout = posix.timeval{ .sec = 2, .usec = 500_000 };
-    while (!signal.RECIEVED) {
-        _ = allocator.reset(.retain_capacity);
-        const conn = try listener.accept();
-        defer conn.stream.close();
-
-        try posix.setsockopt(
-            conn.stream.handle,
-            posix.SOL.SOCKET,
-            posix.SO.RCVTIMEO,
-            &std.mem.toBytes(timeout),
-        );
-        handle(arena, &conn) catch |err| {
-            try handleError(&conn, err);
-            continue;
-        };
-        const res = "HTTP/1.0 204 No Content\r\n\r\n";
-        _ = try conn.stream.write(res);
-    }
-}
-
 fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !void {
     log.err("Request Parsing {}", .{err});
     const res = switch (err) {
@@ -228,9 +224,7 @@ fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !voi
     _ = try conn.stream.write(res);
 }
 
-fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) Request.ParseError!void {
-    log.info("Received conn: {f}", .{conn.address});
-
+fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) Request.ParseError!bool {
     var buf: [1024 * 8]u8 = undefined;
     var stream_reader = conn.stream.reader(&buf);
     const reader = stream_reader.interface();
@@ -245,5 +239,53 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) Request.
     var done = false;
     while (!done) {
         done = try req.parseMore(arena, reader);
+    }
+
+    const res = "HTTP/1.1 204 No Content\r\n\r\n";
+    _ = conn.stream.write(res) catch |err| log.err("Failed to respond {}", .{err});
+    return req.keepAlive();
+}
+
+fn worker(id: u16) !void {
+    log.info("Starting worker {}", .{id});
+
+    // Prevent allocating to a core we dont have
+    const max_cores = try std.Thread.getCpuCount();
+    try pinToCore(@intCast(id % max_cores));
+
+    var allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const arena = allocator.allocator();
+
+    const address = net.Address.initIp6(comptime [_]u8{0} ** 16, 8080, 0, 0);
+    const options = net.Address.ListenOptions{ .reuse_address = true };
+
+    var listener = try address.listen(options);
+    defer listener.deinit();
+
+    const timeout = posix.timeval{ .sec = 5, .usec = 0 };
+    while (!signal.RECIEVED) {
+        _ = allocator.reset(.retain_capacity);
+        const conn = try listener.accept();
+        defer conn.stream.close();
+        log.info("Received conn: {f}", .{conn.address});
+
+        try posix.setsockopt(
+            conn.stream.handle,
+            posix.SOL.SOCKET,
+            posix.SO.RCVTIMEO,
+            &std.mem.toBytes(timeout),
+        );
+
+        var keepAlive = true;
+        while (keepAlive) {
+            keepAlive = handle(arena, &conn) catch |err| {
+                switch (err) {
+                    std.Io.Reader.Error.ReadFailed => log.debug("{f} timed out", .{conn.address}),
+                    std.Io.Reader.Error.EndOfStream => log.debug("{f} closed connection", .{conn.address}),
+                    else => try handleError(&conn, err),
+                }
+                break;
+            };
+        }
     }
 }
