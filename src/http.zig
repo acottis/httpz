@@ -127,7 +127,9 @@ const Request = struct {
         var headers = std.ArrayList(Header).initCapacity(arena, 32) catch return ParseError.Internal;
 
         var maybe_content_ln: ?u64 = null;
-        var connection: Connection = if (version == Version.@"HTTP/1.1") Connection.@"keep-alive" else Connection.close;
+        var connection: Connection = if (version != Version.@"HTTP/1.0") Connection.@"keep-alive" else Connection.close;
+
+        // TODO: Maybe move the specific key checkouts out
         while (headers_parts.next()) |header| {
             var header_parts = splitSequence(u8, header, ": ");
 
@@ -213,13 +215,13 @@ fn pinToCore(core: u16) !void {
 fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !void {
     log.err("Request Parsing {}", .{err});
     const res = switch (err) {
-        error.BadHeader => "HTTP/1.0 400 Bad Request - Malformed Header\r\n\r\n",
-        error.MissingCRLFCRLF => "HTTP/1.0 400 Bad Request - Missing CRLFCRLF\r\n\r\n",
-        error.ContentTooLarge => "HTTP/1.0 400 Bad Request - Content Too Large\r\n\r\n",
-        error.Internal => "HTTP/1.0 500 Internal Server Error\r\n\r\n",
-        error.Method => "HTTP/1.0 501 Not Implemented\r\n\r\n",
-        error.Version => "HTTP/1.0 505 HTTP Version Not Supported\r\n\r\n",
-        else => "HTTP/1.0 400 Bad Request\r\n\r\n",
+        error.BadHeader => "HTTP/1.1 400 Bad Request - Malformed Header\r\n\r\n",
+        error.MissingCRLFCRLF => "HTTP/1.1 400 Bad Request - Missing CRLFCRLF\r\n\r\n",
+        error.ContentTooLarge => "HTTP/1.1 400 Bad Request - Content Too Large\r\n\r\n",
+        error.Internal => "HTTP/1.1 500 Internal Server Error\r\n\r\n",
+        error.Method => "HTTP/1.1 501 Not Implemented\r\n\r\n",
+        error.Version => "HTTP/1.1 505 HTTP Version Not Supported\r\n\r\n",
+        else => "HTTP/1.1 400 Bad Request\r\n\r\n",
     };
     _ = try conn.stream.write(res);
 }
@@ -243,6 +245,7 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) Request.
 
     const res = "HTTP/1.1 204 No Content\r\n\r\n";
     _ = conn.stream.write(res) catch |err| log.err("Failed to respond {}", .{err});
+
     return req.keepAlive();
 }
 
