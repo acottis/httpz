@@ -18,7 +18,7 @@ pub fn register_handler() void {
 fn handle_signal(sig_num: i32) callconv(.c) void {
     // If this is second time, just die
     if (RECIEVED) {
-        log.info("Received Additional Signal {}", .{sig_num});
+        log.warn("Received Additional Signal {}", .{sig_num});
         std.process.exit(0);
     }
     std.log.info("Received Signal {}", .{sig_num});

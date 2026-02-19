@@ -6,6 +6,8 @@ const splitSequence = std.mem.splitSequence;
 const stringToEnum = std.meta.stringToEnum;
 
 const THREADS = 1;
+// 500 MBs
+const MAX_HTTP_PAYLOAD = 1024 * 1024 * 500;
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "");
@@ -50,40 +52,74 @@ const Header = struct {
     value: []const u8,
 };
 
+// TODO: Keep Alive + Content Length
 const Request = struct {
     method: Method,
     path: []const u8,
     version: Version,
     headers: std.ArrayList(Header),
+    content_length: ?u64,
+    body: ?std.ArrayList(u8),
 
-    fn parse(arena: std.mem.Allocator, buf: []u8) !@This() {
+    const ParseError = error{
+        BadHeader,
+        Internal,
+        Method,
+        Version,
+        Bad,
+        ContentTooLarge,
+    } || std.mem.Allocator.Error;
+
+    fn parse(arena: std.mem.Allocator, buf: []u8) ParseError!@This() {
         var request_parts = splitSequence(u8, buf, "\r\n\r\n");
 
         var headers_parts = splitSequence(u8, request_parts.first(), "\r\n");
         var first_line = splitSequence(u8, headers_parts.first(), " ");
 
-        const method = stringToEnum(Method, first_line.first()) orelse return error.Method;
-        const path = first_line.next() orelse return error.Bad;
-        const version_str = first_line.next() orelse return error.Bad;
-        const version = stringToEnum(Version, version_str) orelse return error.Version;
+        const method = stringToEnum(Method, first_line.first()) orelse return ParseError.Method;
+        const path = first_line.next() orelse return ParseError.Bad;
+        const version_str = first_line.next() orelse return ParseError.Version;
+        const version = stringToEnum(Version, version_str) orelse return ParseError.Version;
 
-        var headers = std.ArrayList(Header).initCapacity(arena, 32) catch return error.Internal;
+        var headers = std.ArrayList(Header).initCapacity(arena, 32) catch return ParseError.Internal;
+        var content_length: ?u64 = null;
         while (headers_parts.next()) |header| {
             var header_parts = splitSequence(u8, header, ": ");
-            const key = header_parts.first();
-            const value = header_parts.next() orelse return error.BadHeader;
 
-            headers.append(arena, .{
-                .key = arena.dupe(u8, key) catch return error.Oom,
-                .value = arena.dupe(u8, value) catch return error.Oom,
-            }) catch return error.Oom;
+            const key = header_parts.first();
+            const value = header_parts.next() orelse return ParseError.BadHeader;
+
+            const key_lower = try std.ascii.allocLowerString(arena, key);
+
+            if (std.mem.eql(u8, key_lower, "content-length")) {
+                content_length = std.fmt.parseInt(u64, value, 10) catch return ParseError.BadHeader;
+
+                if (content_length.? > MAX_HTTP_PAYLOAD) return ParseError.ContentTooLarge;
+            }
+
+            try headers.append(arena, .{
+                .key = key_lower,
+                .value = try arena.dupe(u8, value),
+            });
+        }
+
+        var body: ?std.ArrayList(u8) = null;
+        if (content_length) |total_len| {
+            if (request_parts.next()) |body_slice| {
+                // Lying about Content Length
+                if (body_slice.len > total_len) return ParseError.Bad;
+                body = try std.ArrayList(u8).initCapacity(arena, total_len);
+                try body.?.appendSlice(arena, body_slice);
+            }
         }
 
         return .{
             .method = method,
-            .path = arena.dupe(u8, path) catch return error.Oom,
+            .path = try arena.dupe(u8, path),
             .version = version,
             .headers = headers,
+            .content_length = content_length,
+            .body = body,
         };
     }
 };
@@ -125,31 +161,41 @@ fn worker(id: u16) !void {
     }
 }
 
+fn handle_error(conn: *const net.Server.Connection, err: Request.ParseError) !void {
+    std.log.err("Request Parsing {}", .{err});
+    switch (err) {
+        error.BadHeader => {
+            const res = "HTTP/1.0 400 Bad Request - Malformed Header\r\n\r\n";
+            _ = try conn.stream.write(res);
+        },
+        error.Internal => {
+            const res = "HTTP/1.0 500 Internal Server Error\r\n\r\n";
+            _ = try conn.stream.write(res);
+        },
+        error.Method => {
+            const res = "HTTP/1.0 501 Not Implemented\r\n\r\n";
+            _ = try conn.stream.write(res);
+        },
+        error.Version => {
+            const res = "HTTP/1.0 505 HTTP Version Not Supported\r\n\r\n";
+            _ = try conn.stream.write(res);
+        },
+        else => {
+            const res = "HTTP/1.0 400 Bad Request\r\n\r\n";
+            _ = try conn.stream.write(res);
+        },
+    }
+}
+
 fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) !void {
     log.info("Received conn: {f}", .{conn.address});
 
-    var buf: [1024]u8 = undefined;
-    const len = try conn.stream.read(&buf);
+    var buf: [1024 * 8]u8 = undefined;
+    const stream_reader = conn.stream.reader(&buf);
+    const reader = stream_reader.interface();
 
-    const req = Request.parse(arena, buf[0..len]) catch |err| {
-        switch (err) {
-            error.Internal => {
-                const res = "HTTP/1.0 50 Internal Server Error\r\n\r\n";
-                _ = try conn.stream.write(res);
-            },
-            error.Method => {
-                const res = "HTTP/1.0 501 Not Implemented\r\n\r\n";
-                _ = try conn.stream.write(res);
-            },
-            error.Version => {
-                const res = "HTTP/1.0 505 HTTP Version Not Supported\r\n\r\n";
-                _ = try conn.stream.write(res);
-            },
-            else => {
-                const res = "HTTP/1.0 400 Bad Request\r\n\r\n";
-                _ = try conn.stream.write(res);
-            },
-        }
+    const req = Request.parse(arena, reader) catch |err| {
+        try handle_error(conn, err);
         return;
     };
 
@@ -158,6 +204,28 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) !void {
         std.log.debug("{s}: {s}", .{ header.key, header.value });
     }
 
-    const res = "HTTP/1.0 204 No Content\r\n\r\n";
-    _ = try conn.stream.write(res);
+    // No more bytes expected
+    if (req.content_length == null) {
+        const res = "HTTP/1.0 204 No Content\r\n\r\n";
+        _ = try conn.stream.write(res);
+        return;
+    }
+
+    // More bytes expected
+    const content_length = req.content_length.?;
+
+    var done = false;
+    while (!done) {
+        const body = req.body orelse continue;
+
+        if (content_length <= body.items.len) {
+            done = true;
+            const res = "HTTP/1.0 204 No Content\r\n\r\n";
+            _ = try conn.stream.write(res);
+            return;
+        }
+
+        std.log.debug("Need more bytes", .{});
+        // len = try conn.stream.read(&buf);
+    }
 }
