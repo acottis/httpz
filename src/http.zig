@@ -57,7 +57,6 @@ const Request = struct {
     path: []const u8,
     version: Version,
     headers: std.ArrayList(Header),
-    content_len: ?u64,
     body: ?std.ArrayList(u8),
 
     const ParseError = error{
@@ -71,12 +70,14 @@ const Request = struct {
         MaxContentLenExceeded,
     } || std.mem.Allocator.Error || std.Io.Reader.Error;
 
-    /// SAFTEFY: Only call this if content_len and body != null
-    fn complete(self: *@This()) bool {
-        std.debug.assert(self.content_len != null);
-
-        if (self.content_len.? == self.body.?.items.len) return true;
+    inline fn complete(self: *@This()) bool {
+        if (self.content_len() == 0) return true;
+        if (self.content_len() == self.body.?.items.len) return true;
         return false;
+    }
+
+    inline fn content_len(self: *@This()) usize {
+        if (self.body != null) return self.body.?.capacity else return 0;
     }
 
     fn parse(arena: std.mem.Allocator, reader: *std.io.Reader) ParseError!@This() {
@@ -98,7 +99,7 @@ const Request = struct {
         const version = stringToEnum(Version, version_str) orelse return ParseError.Version;
 
         var headers = std.ArrayList(Header).initCapacity(arena, 32) catch return ParseError.Internal;
-        var maybe_content_len: ?u64 = null;
+        var maybe_content_ln: ?u64 = null;
         while (headers_parts.next()) |header| {
             var header_parts = splitSequence(u8, header, ": ");
 
@@ -109,9 +110,9 @@ const Request = struct {
             const key_lower = try std.ascii.allocLowerString(arena, key);
 
             if (std.mem.eql(u8, key_lower, "content-length")) {
-                maybe_content_len = std.fmt.parseInt(u64, value, 10) catch return ParseError.BadHeader;
+                maybe_content_ln = std.fmt.parseInt(u64, value, 10) catch return ParseError.BadHeader;
 
-                if (maybe_content_len.? > MAX_CONTENT_LEN) return ParseError.MaxContentLenExceeded;
+                if (maybe_content_ln.? > MAX_CONTENT_LEN) return ParseError.MaxContentLenExceeded;
             }
 
             try headers.append(arena, .{
@@ -121,10 +122,10 @@ const Request = struct {
         }
 
         var body: ?std.ArrayList(u8) = null;
-        if (maybe_content_len) |content_len| {
+        if (maybe_content_ln) |content_ln| {
             // Lying about Content Length
-            if (body_slice.len > content_len) return ParseError.Bad;
-            body = try std.ArrayList(u8).initCapacity(arena, content_len);
+            if (body_slice.len > content_ln) return ParseError.Bad;
+            body = try std.ArrayList(u8).initCapacity(arena, content_ln);
             try body.?.appendSlice(arena, body_slice);
         }
 
@@ -133,26 +134,23 @@ const Request = struct {
             .path = try arena.dupe(u8, path),
             .version = version,
             .headers = headers,
-            .content_len = maybe_content_len,
             .body = body,
         };
     }
 
-    /// SAFTEFY: Only call this if content_len and body != null
     fn parseMore(
         self: *@This(),
         arena: std.mem.Allocator,
         reader: *std.io.Reader,
     ) ParseError!bool {
-        std.debug.assert(self.content_len != null);
+        if (self.complete()) return true;
 
         const body = &self.body.?;
-        const content_len = self.content_len.?;
         log.debug("{}", .{body});
 
         try reader.fillMore();
         const bytes_read = body.items.len + reader.end;
-        if (bytes_read > content_len) {
+        if (bytes_read > self.content_len()) {
             return Request.ParseError.ContentTooLarge;
         }
 
@@ -161,7 +159,6 @@ const Request = struct {
 
         try body.appendSlice(arena, bytes);
 
-        if (self.complete()) return true;
         return false;
     }
 };
@@ -235,12 +232,6 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) Request.
     for (req.headers.items) |header| {
         log.debug("{s}: {s}", .{ header.key, header.value });
     }
-
-    // No more bytes expected
-    if (req.content_len == null) return;
-
-    // All bytes account for
-    if (req.complete()) return;
 
     var done = false;
     while (!done) {
