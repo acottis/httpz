@@ -22,7 +22,7 @@ pub const Server = struct {
         signal.register_handler();
 
         const cores = try std.Thread.getCpuCount();
-        std.log.info("System has {} cores", .{cores});
+        log.info("System has {} cores", .{cores});
         var threads: [THREADS]std.Thread = undefined;
         for (0..THREADS) |i| {
             const id: u8 = @intCast(i);
@@ -69,9 +69,9 @@ const Request = struct {
         Bad,
         ContentTooLarge,
         MaxContentLenExceeded,
-    } || std.mem.Allocator.Error || std.io.Reader.Error;
+    } || std.mem.Allocator.Error || std.Io.Reader.Error;
 
-    fn parse(arena: std.mem.Allocator, reader: *std.Io.Reader) ParseError!@This() {
+    fn parse(arena: std.mem.Allocator, reader: *std.io.Reader) ParseError!@This() {
         // Fill the buffer then set end to 0 so the next fill will fill
         // in the first bytes again
         try reader.fillMore();
@@ -133,12 +133,12 @@ const Request = struct {
     fn parseMore(
         self: *@This(),
         arena: std.mem.Allocator,
-        reader: *std.Io.Reader,
+        reader: *std.io.Reader,
     ) ParseError!bool {
         // SAFTEFY: We created a body ArrayList if content_length != null
         const body = &self.body.?;
         const content_len = self.content_len.?;
-        std.log.debug("{}", .{body});
+        log.debug("{}", .{body});
 
         if (self.content_len == body.items.len) return true;
 
@@ -199,7 +199,7 @@ fn worker(id: u16) !void {
 }
 
 fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !void {
-    std.log.err("Request Parsing {}", .{err});
+    log.err("Request Parsing {}", .{err});
     const res = switch (err) {
         error.BadHeader => "HTTP/1.0 400 Bad Request - Malformed Header\r\n\r\n",
         error.MissingCRLFCRLF => "HTTP/1.0 400 Bad Request - Missing CRLFCRLF\r\n\r\n",
@@ -221,9 +221,9 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) Request.
 
     var req = try Request.parse(arena, reader);
 
-    std.log.debug("{}", .{req});
+    log.debug("{}", .{req});
     for (req.headers.items) |header| {
-        std.log.debug("{s}: {s}", .{ header.key, header.value });
+        log.debug("{s}: {s}", .{ header.key, header.value });
     }
 
     // No more bytes expected
