@@ -57,7 +57,7 @@ const Request = struct {
     path: []const u8,
     version: Version,
     headers: std.ArrayList(Header),
-    content_length: ?u64,
+    content_len: ?u64,
     body: ?std.ArrayList(u8),
 
     const ParseError = error{
@@ -125,7 +125,7 @@ const Request = struct {
             .path = try arena.dupe(u8, path),
             .version = version,
             .headers = headers,
-            .content_length = content_length,
+            .content_len = content_length,
             .body = body,
         };
     }
@@ -137,33 +137,21 @@ const Request = struct {
     ) ParseError!bool {
         // SAFTEFY: We created a body ArrayList if content_length != null
         const body = &self.body.?;
-        const content_length = self.content_length.?;
+        const content_len = self.content_len.?;
         std.log.debug("{}", .{body});
 
-        if (self.content_length == body.items.len) {
-            return true;
-        }
+        if (self.content_len == body.items.len) return true;
 
         try reader.fillMore();
-
-        if (body.items.len + reader.end > content_length) {
+        const bytes_read = body.items.len + reader.end;
+        if (bytes_read > content_len) {
             return Request.ParseError.ContentTooLarge;
         }
-
-        std.log.debug("Need more bytes End: {}, seek: {}", .{
-            reader.end,
-            reader.seek,
-        });
 
         const bytes = reader.buffer[reader.seek..reader.end];
         reader.end = 0;
 
         try body.appendSlice(arena, bytes);
-        std.log.debug("{s}, {}, {s}", .{
-            bytes,
-            body.items.len,
-            body.items,
-        });
         return false;
     }
 };
@@ -201,7 +189,12 @@ fn worker(id: u16) !void {
         _ = allocator.reset(.retain_capacity);
         const conn = try listener.accept();
         defer conn.stream.close();
-        try handle(arena, &conn);
+        handle(arena, &conn) catch |err| {
+            try handleError(&conn, err);
+            continue;
+        };
+        const res = "HTTP/1.0 204 No Content\r\n\r\n";
+        _ = try conn.stream.write(res);
     }
 }
 
@@ -219,17 +212,14 @@ fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !voi
     _ = try conn.stream.write(res);
 }
 
-fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) !void {
+fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) Request.ParseError!void {
     log.info("Received conn: {f}", .{conn.address});
 
     var buf: [1024 * 8]u8 = undefined;
     var stream_reader = conn.stream.reader(&buf);
     const reader = stream_reader.interface();
 
-    var req = Request.parse(arena, reader) catch |err| {
-        try handleError(conn, err);
-        return;
-    };
+    var req = try Request.parse(arena, reader);
 
     std.log.debug("{}", .{req});
     for (req.headers.items) |header| {
@@ -237,19 +227,10 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) !void {
     }
 
     // No more bytes expected
-    if (req.content_length == null) {
-        const res = "HTTP/1.0 204 No Content\r\n\r\n";
-        _ = try conn.stream.write(res);
-        return;
-    }
+    if (req.content_len == null) return;
 
     var done = false;
     while (!done) {
-        done = req.parseMore(arena, reader) catch |err| {
-            try handleError(conn, err);
-            return;
-        };
+        done = try req.parseMore(arena, reader);
     }
-    const res = "HTTP/1.0 204 No Content\r\n\r\n";
-    _ = try conn.stream.write(res);
 }
