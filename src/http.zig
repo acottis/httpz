@@ -52,7 +52,6 @@ const Header = struct {
     value: []const u8,
 };
 
-// TODO: Keep Alive + Content Length
 const Request = struct {
     method: Method,
     path: []const u8,
@@ -63,17 +62,25 @@ const Request = struct {
 
     const ParseError = error{
         BadHeader,
+        MissingCRLFCRLF,
         Internal,
         Method,
         Version,
         Bad,
         ContentTooLarge,
-    } || std.mem.Allocator.Error;
+    } || std.mem.Allocator.Error || std.io.Reader.Error;
 
-    fn parse(arena: std.mem.Allocator, buf: []u8) ParseError!@This() {
+    fn parse(arena: std.mem.Allocator, reader: *std.Io.Reader) ParseError!@This() {
+        // Fill the buffer then set end to 0 so the next fill will fill
+        // in the first bytes again
+        try reader.fillMore();
+        const buf = reader.buffer[0..reader.end];
+        reader.end = 0;
+
         var request_parts = splitSequence(u8, buf, "\r\n\r\n");
-
         var headers_parts = splitSequence(u8, request_parts.first(), "\r\n");
+        const body_slice = request_parts.next() orelse return error.MissingCRLFCRLF;
+
         var first_line = splitSequence(u8, headers_parts.first(), " ");
 
         const method = stringToEnum(Method, first_line.first()) orelse return ParseError.Method;
@@ -87,6 +94,7 @@ const Request = struct {
             var header_parts = splitSequence(u8, header, ": ");
 
             const key = header_parts.first();
+
             const value = header_parts.next() orelse return ParseError.BadHeader;
 
             const key_lower = try std.ascii.allocLowerString(arena, key);
@@ -105,12 +113,11 @@ const Request = struct {
 
         var body: ?std.ArrayList(u8) = null;
         if (content_length) |total_len| {
-            if (request_parts.next()) |body_slice| {
-                // Lying about Content Length
-                if (body_slice.len > total_len) return ParseError.Bad;
-                body = try std.ArrayList(u8).initCapacity(arena, total_len);
-                try body.?.appendSlice(arena, body_slice);
-            }
+            std.log.debug("im here\n, {any}", .{body_slice});
+            // Lying about Content Length
+            if (body_slice.len > total_len) return ParseError.Bad;
+            body = try std.ArrayList(u8).initCapacity(arena, total_len);
+            try body.?.appendSlice(arena, body_slice);
         }
 
         return .{
@@ -168,6 +175,10 @@ fn handle_error(conn: *const net.Server.Connection, err: Request.ParseError) !vo
             const res = "HTTP/1.0 400 Bad Request - Malformed Header\r\n\r\n";
             _ = try conn.stream.write(res);
         },
+        error.MissingCRLFCRLF => {
+            const res = "HTTP/1.0 400 Bad Request - Missing CRLFCRLF\r\n\r\n";
+            _ = try conn.stream.write(res);
+        },
         error.Internal => {
             const res = "HTTP/1.0 500 Internal Server Error\r\n\r\n";
             _ = try conn.stream.write(res);
@@ -191,10 +202,10 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) !void {
     log.info("Received conn: {f}", .{conn.address});
 
     var buf: [1024 * 8]u8 = undefined;
-    const stream_reader = conn.stream.reader(&buf);
+    var stream_reader = conn.stream.reader(&buf);
     const reader = stream_reader.interface();
 
-    const req = Request.parse(arena, reader) catch |err| {
+    var req = Request.parse(arena, reader) catch |err| {
         try handle_error(conn, err);
         return;
     };
@@ -216,7 +227,9 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) !void {
 
     var done = false;
     while (!done) {
-        const body = req.body orelse continue;
+        // SAFTEFY: We only
+        var body = &req.body.?;
+        std.log.debug("{}", .{body});
 
         if (content_length <= body.items.len) {
             done = true;
@@ -225,7 +238,25 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) !void {
             return;
         }
 
-        std.log.debug("Need more bytes", .{});
-        // len = try conn.stream.read(&buf);
+        std.log.debug("Need more bytes End: {}, seek: {} body_len {}", .{
+            reader.end,
+            reader.seek,
+            body.items.len,
+        });
+        reader.fillMore() catch {
+            std.log.err("Client {f} disconnected unexpectidly", .{conn.address});
+            return;
+        };
+        std.log.debug("Need more bytes End: {}, seek: {}", .{
+            reader.end,
+            reader.seek,
+        });
+        const bytes = reader.buffer[reader.seek..reader.end];
+        try body.appendSlice(arena, bytes);
+        std.log.debug("{s}, {}, {s}", .{
+            bytes,
+            body.items.len,
+            body.items,
+        });
     }
 }
