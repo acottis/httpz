@@ -2,6 +2,7 @@ const std = @import("std");
 const signal = @import("signal.zig");
 const net = std.net;
 const log = std.log;
+const posix = std.posix;
 const splitSequence = std.mem.splitSequence;
 const stringToEnum = std.meta.stringToEnum;
 
@@ -192,10 +193,18 @@ fn worker(id: u16) !void {
     var listener = try address.listen(options);
     defer listener.deinit();
 
+    const timeout = posix.timeval{ .sec = 2, .usec = 500_000 };
     while (!signal.RECIEVED) {
         _ = allocator.reset(.retain_capacity);
         const conn = try listener.accept();
         defer conn.stream.close();
+
+        try posix.setsockopt(
+            conn.stream.handle,
+            posix.SOL.SOCKET,
+            posix.SO.RCVTIMEO,
+            &std.mem.toBytes(timeout),
+        );
         handle(arena, &conn) catch |err| {
             try handleError(&conn, err);
             continue;
