@@ -7,7 +7,7 @@ const stringToEnum = std.meta.stringToEnum;
 
 const THREADS = 1;
 // 500 MBs
-const MAX_HTTP_PAYLOAD = 1024 * 1024 * 500;
+const MAX_CONTENT_LEN = 1024 * 1024 * 500;
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "");
@@ -68,6 +68,7 @@ const Request = struct {
         Version,
         Bad,
         ContentTooLarge,
+        MaxContentLenExceeded,
     } || std.mem.Allocator.Error || std.io.Reader.Error;
 
     fn parse(arena: std.mem.Allocator, reader: *std.Io.Reader) ParseError!@This() {
@@ -102,7 +103,7 @@ const Request = struct {
             if (std.mem.eql(u8, key_lower, "content-length")) {
                 content_length = std.fmt.parseInt(u64, value, 10) catch return ParseError.BadHeader;
 
-                if (content_length.? > MAX_HTTP_PAYLOAD) return ParseError.ContentTooLarge;
+                if (content_length.? > MAX_CONTENT_LEN) return ParseError.MaxContentLenExceeded;
             }
 
             try headers.append(arena, .{
@@ -113,7 +114,6 @@ const Request = struct {
 
         var body: ?std.ArrayList(u8) = null;
         if (content_length) |total_len| {
-            std.log.debug("im here\n, {any}", .{body_slice});
             // Lying about Content Length
             if (body_slice.len > total_len) return ParseError.Bad;
             body = try std.ArrayList(u8).initCapacity(arena, total_len);
@@ -129,9 +129,46 @@ const Request = struct {
             .body = body,
         };
     }
+
+    fn parseMore(
+        self: *@This(),
+        arena: std.mem.Allocator,
+        reader: *std.Io.Reader,
+    ) ParseError!bool {
+        // SAFTEFY: We created a body ArrayList if content_length != null
+        const body = &self.body.?;
+        const content_length = self.content_length.?;
+        std.log.debug("{}", .{body});
+
+        if (self.content_length == body.items.len) {
+            return true;
+        }
+
+        try reader.fillMore();
+
+        if (body.items.len + reader.end > content_length) {
+            return Request.ParseError.ContentTooLarge;
+        }
+
+        std.log.debug("Need more bytes End: {}, seek: {}", .{
+            reader.end,
+            reader.seek,
+        });
+
+        const bytes = reader.buffer[reader.seek..reader.end];
+        reader.end = 0;
+
+        try body.appendSlice(arena, bytes);
+        std.log.debug("{s}, {}, {s}", .{
+            bytes,
+            body.items.len,
+            body.items,
+        });
+        return false;
+    }
 };
 
-fn pin_to_core(core: u16) !void {
+fn pinToCore(core: u16) !void {
     var cpu_set = c.cpu_set_t{};
     const index = core / 64;
     const bit: u6 = @intCast(core % 64);
@@ -149,7 +186,7 @@ fn worker(id: u16) !void {
 
     // Prevent allocating to a core we dont have
     const max_cores = try std.Thread.getCpuCount();
-    try pin_to_core(@intCast(id % max_cores));
+    try pinToCore(@intCast(id % max_cores));
 
     var allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const arena = allocator.allocator();
@@ -168,34 +205,18 @@ fn worker(id: u16) !void {
     }
 }
 
-fn handle_error(conn: *const net.Server.Connection, err: Request.ParseError) !void {
+fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !void {
     std.log.err("Request Parsing {}", .{err});
-    switch (err) {
-        error.BadHeader => {
-            const res = "HTTP/1.0 400 Bad Request - Malformed Header\r\n\r\n";
-            _ = try conn.stream.write(res);
-        },
-        error.MissingCRLFCRLF => {
-            const res = "HTTP/1.0 400 Bad Request - Missing CRLFCRLF\r\n\r\n";
-            _ = try conn.stream.write(res);
-        },
-        error.Internal => {
-            const res = "HTTP/1.0 500 Internal Server Error\r\n\r\n";
-            _ = try conn.stream.write(res);
-        },
-        error.Method => {
-            const res = "HTTP/1.0 501 Not Implemented\r\n\r\n";
-            _ = try conn.stream.write(res);
-        },
-        error.Version => {
-            const res = "HTTP/1.0 505 HTTP Version Not Supported\r\n\r\n";
-            _ = try conn.stream.write(res);
-        },
-        else => {
-            const res = "HTTP/1.0 400 Bad Request\r\n\r\n";
-            _ = try conn.stream.write(res);
-        },
-    }
+    const res = switch (err) {
+        error.BadHeader => "HTTP/1.0 400 Bad Request - Malformed Header\r\n\r\n",
+        error.MissingCRLFCRLF => "HTTP/1.0 400 Bad Request - Missing CRLFCRLF\r\n\r\n",
+        error.ContentTooLarge => "HTTP/1.0 400 Bad Request - Content Too Large\r\n\r\n",
+        error.Internal => "HTTP/1.0 500 Internal Server Error\r\n\r\n",
+        error.Method => "HTTP/1.0 501 Not Implemented\r\n\r\n",
+        error.Version => "HTTP/1.0 505 HTTP Version Not Supported\r\n\r\n",
+        else => "HTTP/1.0 400 Bad Request\r\n\r\n",
+    };
+    _ = try conn.stream.write(res);
 }
 
 fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) !void {
@@ -206,7 +227,7 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) !void {
     const reader = stream_reader.interface();
 
     var req = Request.parse(arena, reader) catch |err| {
-        try handle_error(conn, err);
+        try handleError(conn, err);
         return;
     };
 
@@ -222,41 +243,13 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) !void {
         return;
     }
 
-    // More bytes expected
-    const content_length = req.content_length.?;
-
     var done = false;
     while (!done) {
-        // SAFTEFY: We only
-        var body = &req.body.?;
-        std.log.debug("{}", .{body});
-
-        if (content_length <= body.items.len) {
-            done = true;
-            const res = "HTTP/1.0 204 No Content\r\n\r\n";
-            _ = try conn.stream.write(res);
-            return;
-        }
-
-        std.log.debug("Need more bytes End: {}, seek: {} body_len {}", .{
-            reader.end,
-            reader.seek,
-            body.items.len,
-        });
-        reader.fillMore() catch {
-            std.log.err("Client {f} disconnected unexpectidly", .{conn.address});
+        done = req.parseMore(arena, reader) catch |err| {
+            try handleError(conn, err);
             return;
         };
-        std.log.debug("Need more bytes End: {}, seek: {}", .{
-            reader.end,
-            reader.seek,
-        });
-        const bytes = reader.buffer[reader.seek..reader.end];
-        try body.appendSlice(arena, bytes);
-        std.log.debug("{s}, {}, {s}", .{
-            bytes,
-            body.items.len,
-            body.items,
-        });
     }
+    const res = "HTTP/1.0 204 No Content\r\n\r\n";
+    _ = try conn.stream.write(res);
 }
