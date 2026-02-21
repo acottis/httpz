@@ -1,5 +1,6 @@
 const std = @import("std");
 const signal = @import("signal.zig");
+const Trie = @import("trie.zig").Trie;
 const net = std.net;
 const log = std.log;
 const posix = std.posix;
@@ -15,11 +16,18 @@ const c = @cImport({
     @cInclude("sched.h");
 });
 
+const Handler = *const fn (Request) void;
+
 pub const Server = struct {
-    pub fn init() @This() {
-        return @This(){};
+    paths: Trie(Handler),
+
+    pub fn init(allocator: std.mem.Allocator) @This() {
+        return .{
+            .paths = Trie(Handler).init(allocator),
+        };
     }
-    pub fn listen() !void {
+
+    pub fn listen(self: *@This()) !void {
         signal.register_handler();
 
         const cores = try std.Thread.getCpuCount();
@@ -27,13 +35,24 @@ pub const Server = struct {
         var threads: [THREADS]std.Thread = undefined;
         for (0..THREADS) |i| {
             const id: u8 = @intCast(i);
-            threads[i] = try std.Thread.spawn(.{}, worker, .{id});
+            threads[i] = try std.Thread.spawn(.{}, worker, .{
+                id,
+                &self.paths,
+            });
         }
 
         // Dont exit program while any threads are running
         for (threads) |thread| {
             thread.join();
         }
+    }
+
+    pub fn add_path(
+        self: *@This(),
+        path: []const u8,
+        func: Handler,
+    ) !void {
+        try self.paths.insert(path, func);
     }
 };
 
@@ -58,7 +77,7 @@ const Header = struct {
     value: []const u8,
 };
 
-const Request = struct {
+pub const Request = struct {
     method: Method,
     path: []const u8,
     version: Version,
@@ -107,8 +126,8 @@ const Request = struct {
     }
 
     fn parse(arena: std.mem.Allocator, reader: *std.io.Reader) ParseError!@This() {
-        // Fill the buffer then set end to 0 so the next fill will fill
-        // in the first bytes again
+        // Fill the buffer then set readers end to 0 so the next fill will
+        // fill in the first bytes again
         try reader.fillMore();
         const buf = reader.buffer[0..reader.end];
         reader.end = 0;
@@ -150,10 +169,7 @@ const Request = struct {
                 continue;
             }
 
-            try headers.append(arena, .{
-                .key = key_lower,
-                .value = try arena.dupe(u8, value),
-            });
+            try headers.append(arena, .{ .key = key_lower, .value = try arena.dupe(u8, value) });
         }
 
         var body: ?std.ArrayList(u8) = null;
@@ -182,7 +198,6 @@ const Request = struct {
         if (self.complete()) return true;
 
         const body = &self.body.?;
-        log.debug("{}", .{body});
 
         try reader.fillMore();
         const bytes_read = body.items.len + reader.end;
@@ -226,14 +241,13 @@ fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !voi
     _ = try conn.stream.write(res);
 }
 
-fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) Request.ParseError!bool {
+fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection, paths: *const Trie(Handler)) Request.ParseError!bool {
     var buf: [1024 * 8]u8 = undefined;
     var stream_reader = conn.stream.reader(&buf);
     const reader = stream_reader.interface();
 
     var req = try Request.parse(arena, reader);
 
-    log.debug("{}", .{req});
     for (req.headers.items) |header| {
         log.debug("{s}: {s}", .{ header.key, header.value });
     }
@@ -243,13 +257,18 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection) Request.
         done = try req.parseMore(arena, reader);
     }
 
+    if (paths.search(req.path)) |func| {
+        func(req);
+    }
+
+    // TODO: User defined functionality here
     const res = "HTTP/1.1 204 No Content\r\n\r\n";
     _ = conn.stream.write(res) catch |err| log.err("Failed to respond {}", .{err});
 
     return req.keepAlive();
 }
 
-fn worker(id: u16) !void {
+fn worker(id: u16, paths: *const Trie(Handler)) !void {
     log.info("Starting worker {}", .{id});
 
     // Prevent allocating to a core we dont have
@@ -281,7 +300,7 @@ fn worker(id: u16) !void {
 
         var keepAlive = true;
         while (keepAlive) {
-            keepAlive = handle(arena, &conn) catch |err| {
+            keepAlive = handle(arena, &conn, paths) catch |err| {
                 switch (err) {
                     std.Io.Reader.Error.ReadFailed => log.debug("{f} timed out", .{conn.address}),
                     std.Io.Reader.Error.EndOfStream => log.debug("{f} closed connection", .{conn.address}),
