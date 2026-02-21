@@ -229,6 +229,7 @@ pub const Response = struct {
     status_code: StatusCode,
     headers: std.ArrayList(Header),
     body: ?std.ArrayList(u8),
+    connection: Connection,
 
     pub const StatusCode = enum {
         @"200 Ok",
@@ -247,6 +248,7 @@ pub const Response = struct {
             .version = Version.@"HTTP/1.1",
             .status_code = status_code,
             .headers = std.ArrayList(Header).empty,
+            .connection = Connection.@"keep-alive",
             .body = null,
         };
     }
@@ -261,29 +263,24 @@ pub const Response = struct {
         try self.headers.append(alloc, header);
     }
 
-    pub fn fromStatusCode(status_code: StatusCode) @This() {
-        return .{
-            .version = Version.@"HTTP/1.1",
-            .status_code = status_code,
-            .headers = std.ArrayList(Header).empty,
-            .body = null,
-        };
+    pub fn close(self: *@This()) void {
+        self.connection = Connection.close;
     }
 
     pub inline fn noContent() @This() {
-        return fromStatusCode(StatusCode.@"204 No Content");
+        return init(StatusCode.@"204 No Content");
     }
 
     pub inline fn badRequest() @This() {
-        return fromStatusCode(StatusCode.@"400 Bad Request");
+        return init(StatusCode.@"400 Bad Request");
     }
 
     pub inline fn notFound() @This() {
-        return fromStatusCode(StatusCode.@"404 Not Found");
+        return init(StatusCode.@"404 Not Found");
     }
 
     pub inline fn internalServerError() @This() {
-        return fromStatusCode(StatusCode.@"500 Internal Server Error");
+        return init(StatusCode.@"500 Internal Server Error");
     }
 
     fn write(self: *const @This(), writer: *std.io.Writer) !void {
@@ -291,6 +288,9 @@ pub const Response = struct {
             @tagName(self.version),
             @tagName(self.status_code),
         });
+        if (self.connection == Connection.close) {
+            _ = try writer.write("Connection: close\r\n");
+        }
         for (self.headers.items) |header| {
             try writer.print("{s}: {s}\r\n", .{ header.key, header.value });
         }
@@ -316,9 +316,9 @@ fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !voi
     log.err("Request Parsing {}", .{err});
     const StatusCode = Response.StatusCode;
     const res = switch (err) {
-        error.Internal => Response.fromStatusCode(StatusCode.@"500 Internal Server Error"),
-        error.Method => Response.fromStatusCode(StatusCode.@"501 Not Implemented"),
-        error.Version => Response.fromStatusCode(StatusCode.@"505 HTTP Version Not Supported"),
+        error.Internal => Response.init(StatusCode.@"500 Internal Server Error"),
+        error.Method => Response.init(StatusCode.@"501 Not Implemented"),
+        error.Version => Response.init(StatusCode.@"505 HTTP Version Not Supported"),
         else => Response.badRequest(),
     };
     var buf: [1024]u8 = undefined;
@@ -354,10 +354,11 @@ fn handle(arena: Allocator, conn: *const net.Server.Connection, paths: *const Tr
     }
 
     const res = handleRequest(arena, paths, &req);
+
     var writer = conn.stream.writer(&buf);
     res.write(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
 
-    return req.keepAlive();
+    return if (res.connection == Connection.close) false else req.keepAlive();
 }
 
 fn worker(id: u16, paths: *const Trie(Handler)) !void {
