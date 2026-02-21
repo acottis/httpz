@@ -16,7 +16,7 @@ const c = @cImport({
     @cInclude("sched.h");
 });
 
-const Handler = *const fn (Request) void;
+const Handler = *const fn (Request) Response;
 
 pub const Server = struct {
     paths: Trie(Handler),
@@ -216,6 +216,50 @@ pub const Request = struct {
     }
 };
 
+const StatusCode = enum {
+    @"200 Ok",
+    @"204 No Content",
+    @"400 Bad Request",
+    @"404 Not Found",
+    @"500 Internal Server Error",
+    @"501 Not Implemented",
+    @"505 HTTP Version Not Supported",
+};
+
+pub const Response = struct {
+    version: Version,
+    status_code: StatusCode,
+    headers: ?std.ArrayList(Header),
+
+    pub fn fromStatusCode(status_code: StatusCode) @This() {
+        return .{
+            .version = Version.@"HTTP/1.1",
+            .status_code = status_code,
+            .headers = null,
+        };
+    }
+
+    pub inline fn noContent() @This() {
+        return fromStatusCode(StatusCode.@"204 No Content");
+    }
+
+    pub fn badRequest() @This() {
+        return fromStatusCode(StatusCode.@"400 Bad Request");
+    }
+
+    pub fn notFound() @This() {
+        return fromStatusCode(StatusCode.@"404 Not Found");
+    }
+
+    pub fn write(self: *const @This(), writer: *std.io.Writer) !void {
+        try writer.print("{s} {s}\r\n\r\n", .{
+            @tagName(self.version),
+            @tagName(self.status_code),
+        });
+        try writer.flush();
+    }
+};
+
 fn pinToCore(core: u16) !void {
     var cpu_set = c.cpu_set_t{};
     const index = core / 64;
@@ -232,15 +276,14 @@ fn pinToCore(core: u16) !void {
 fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !void {
     log.err("Request Parsing {}", .{err});
     const res = switch (err) {
-        error.BadHeader => "HTTP/1.1 400 Bad Request - Malformed Header\r\n\r\n",
-        error.MissingCRLFCRLF => "HTTP/1.1 400 Bad Request - Missing CRLFCRLF\r\n\r\n",
-        error.ContentTooLarge => "HTTP/1.1 400 Bad Request - Content Too Large\r\n\r\n",
-        error.Internal => "HTTP/1.1 500 Internal Server Error\r\n\r\n",
-        error.Method => "HTTP/1.1 501 Not Implemented\r\n\r\n",
-        error.Version => "HTTP/1.1 505 HTTP Version Not Supported\r\n\r\n",
-        else => "HTTP/1.1 400 Bad Request\r\n\r\n",
+        error.Internal => Response.fromStatusCode(StatusCode.@"500 Internal Server Error"),
+        error.Method => Response.fromStatusCode(StatusCode.@"501 Not Implemented"),
+        error.Version => Response.fromStatusCode(StatusCode.@"505 HTTP Version Not Supported"),
+        else => Response.badRequest(),
     };
-    _ = try conn.stream.write(res);
+    var buf: [1024]u8 = undefined;
+    var writer = conn.stream.writer(&buf);
+    try res.write(&writer.interface);
 }
 
 fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection, paths: *const Trie(Handler)) Request.ParseError!bool {
@@ -259,13 +302,10 @@ fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection, paths: *
         done = try req.parseMore(arena, reader);
     }
 
-    if (paths.search(req.path)) |func| {
-        func(req);
-    }
+    const res = if (paths.search(req.path)) |func| func(req) else Response.notFound();
 
-    // TODO: User defined functionality here
-    const res = "HTTP/1.1 204 No Content\r\n\r\n";
-    _ = conn.stream.write(res) catch |err| log.err("Failed to respond {}", .{err});
+    var writer = conn.stream.writer(&buf);
+    res.write(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
 
     return req.keepAlive();
 }

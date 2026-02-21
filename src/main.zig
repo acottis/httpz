@@ -12,6 +12,7 @@ pub fn main() !void {
     try server.listen();
 }
 
-fn foo(req: http.Request) void {
+fn foo(req: http.Request) http.Response {
     std.log.info("From path: {s}", .{req.path});
+    return http.Response.noContent();
 }
