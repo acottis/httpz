@@ -227,9 +227,9 @@ pub const Request = struct {
 pub const Response = struct {
     version: Version,
     status_code: StatusCode,
+    connection: Connection,
     headers: std.ArrayList(Header),
     body: ?std.ArrayList(u8),
-    connection: Connection,
 
     pub const StatusCode = enum {
         @"200 Ok",
@@ -247,15 +247,20 @@ pub const Response = struct {
         return .{
             .version = Version.@"HTTP/1.1",
             .status_code = status_code,
-            .headers = std.ArrayList(Header).empty,
             .connection = Connection.@"keep-alive",
+            .headers = std.ArrayList(Header).empty,
             .body = null,
         };
     }
 
+    pub fn setBody(self: *@This(), alloc: Allocator, body: []const u8) !void {
+        self.body = std.ArrayList(u8).empty;
+        try self.body.?.appendSlice(alloc, body);
+    }
+
     pub fn setHeader(
         self: *@This(),
-        alloc: std.mem.Allocator,
+        alloc: Allocator,
         key: []const u8,
         value: []const u8,
     ) !void {
@@ -288,6 +293,9 @@ pub const Response = struct {
             @tagName(self.version),
             @tagName(self.status_code),
         });
+
+        const content_len = if (self.body) |b| b.items.len else 0;
+        try writer.print("Content-Length: {}\r\n", .{content_len});
         if (self.connection == Connection.close) {
             _ = try writer.write("Connection: close\r\n");
         }
@@ -295,6 +303,10 @@ pub const Response = struct {
             try writer.print("{s}: {s}\r\n", .{ header.key, header.value });
         }
         _ = try writer.write("\r\n");
+
+        if (self.body) |body| {
+            try writer.print("{s}", .{body.items});
+        }
         try writer.flush();
     }
 };

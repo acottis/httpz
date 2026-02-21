@@ -14,13 +14,13 @@ pub fn main() !void {
     try server.listen();
 }
 
-fn foo(_: Allocator, req: *const http.Request) !http.Response {
+fn foo(alloc: Allocator, req: *const http.Request) !http.Response {
     std.log.info("From path: {s}", .{req.path});
     for (req.headers.items) |header| {
         std.log.debug("{s}: {s}", .{ header.key, header.value });
     }
 
     var res = http.Response.init(StatusCode.@"200 Ok");
-    res.close();
+    try res.setBody(alloc, "Goodbye World!");
     return res;
 }
