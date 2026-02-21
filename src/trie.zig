@@ -42,13 +42,14 @@ pub fn Trie(comptime T: type) type {
                     // Go Deeper
                     if (child.node) |n| {
                         node = n;
-                        remaining = remaining[1..remaining.len];
-                    } else {
-                        // Travesesed as much of the key as possible but no
-                        // deeper nodes exist
-                        return null;
+                        break;
                     }
+
+                    // Travesesed as much of the key as possible but no
+                    // deeper nodes exist
+                    return null;
                 }
+                remaining = remaining[1..remaining.len];
             }
             return null;
         }
@@ -86,7 +87,7 @@ pub fn Trie(comptime T: type) type {
                 try node.children.append(self.allocator, .{
                     .char = remaining[0],
                     .node = new_node,
-                    .value = value,
+                    .value = null,
                 });
                 node = new_node;
                 remaining = remaining[1..remaining.len];
@@ -140,4 +141,21 @@ test "insert cap search caps" {
     var trie = Trie(u32).init(allocator);
     try trie.insert("cap", 20);
     try std.testing.expect(trie.search("caps") == null);
+}
+test "ca should not return cat" {
+    var buffer: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    const allocator = fba.allocator();
+
+    var trie = Trie(u32).init(allocator);
+    try trie.insert("cat", 20);
+    try std.testing.expect(trie.search("ca") == null);
+}
+test "dont infinite search" {
+    var buffer: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    const allocator = fba.allocator();
+
+    var trie = Trie(u32).init(allocator);
+    try std.testing.expect(trie.search("c") == null);
 }
