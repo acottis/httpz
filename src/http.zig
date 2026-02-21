@@ -6,6 +6,7 @@ const log = std.log;
 const posix = std.posix;
 const splitSequence = std.mem.splitSequence;
 const stringToEnum = std.meta.stringToEnum;
+const Allocator = std.mem.Allocator;
 
 const THREADS = 1;
 // 500 MBs
@@ -16,7 +17,7 @@ const c = @cImport({
     @cInclude("sched.h");
 });
 
-const Handler = *const fn (Request) Response;
+const Handler = *const fn (Allocator, *const Request) anyerror!Response;
 
 pub const Server = struct {
     paths: Trie(Handler),
@@ -74,9 +75,16 @@ const Connection = enum {
     @"keep-alive",
 };
 
-const Header = struct {
+pub const Header = struct {
     key: []const u8,
     value: []const u8,
+
+    pub fn init(alloc: Allocator, key: []const u8, value: []const u8) !@This() {
+        return .{
+            .key = try alloc.dupe(u8, key),
+            .value = try alloc.dupe(u8, value),
+        };
+    }
 };
 
 pub const Request = struct {
@@ -216,26 +224,49 @@ pub const Request = struct {
     }
 };
 
-const StatusCode = enum {
-    @"200 Ok",
-    @"204 No Content",
-    @"400 Bad Request",
-    @"404 Not Found",
-    @"500 Internal Server Error",
-    @"501 Not Implemented",
-    @"505 HTTP Version Not Supported",
-};
-
 pub const Response = struct {
     version: Version,
     status_code: StatusCode,
-    headers: ?std.ArrayList(Header),
+    headers: std.ArrayList(Header),
+    body: ?std.ArrayList(u8),
+
+    pub const StatusCode = enum {
+        @"200 Ok",
+        @"204 No Content",
+        @"400 Bad Request",
+        @"404 Not Found",
+        @"500 Internal Server Error",
+        @"501 Not Implemented",
+        @"505 HTTP Version Not Supported",
+    };
+
+    pub fn init(
+        status_code: StatusCode,
+    ) @This() {
+        return .{
+            .version = Version.@"HTTP/1.1",
+            .status_code = status_code,
+            .headers = std.ArrayList(Header).empty,
+            .body = null,
+        };
+    }
+
+    pub fn setHeader(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        const header = try Header.init(alloc, key, value);
+        try self.headers.append(alloc, header);
+    }
 
     pub fn fromStatusCode(status_code: StatusCode) @This() {
         return .{
             .version = Version.@"HTTP/1.1",
             .status_code = status_code,
-            .headers = null,
+            .headers = std.ArrayList(Header).empty,
+            .body = null,
         };
     }
 
@@ -243,19 +274,27 @@ pub const Response = struct {
         return fromStatusCode(StatusCode.@"204 No Content");
     }
 
-    pub fn badRequest() @This() {
+    pub inline fn badRequest() @This() {
         return fromStatusCode(StatusCode.@"400 Bad Request");
     }
 
-    pub fn notFound() @This() {
+    pub inline fn notFound() @This() {
         return fromStatusCode(StatusCode.@"404 Not Found");
     }
 
-    pub fn write(self: *const @This(), writer: *std.io.Writer) !void {
-        try writer.print("{s} {s}\r\n\r\n", .{
+    pub inline fn internalServerError() @This() {
+        return fromStatusCode(StatusCode.@"500 Internal Server Error");
+    }
+
+    fn write(self: *const @This(), writer: *std.io.Writer) !void {
+        try writer.print("{s} {s}\r\n", .{
             @tagName(self.version),
             @tagName(self.status_code),
         });
+        for (self.headers.items) |header| {
+            try writer.print("{s}: {s}\r\n", .{ header.key, header.value });
+        }
+        _ = try writer.write("\r\n");
         try writer.flush();
     }
 };
@@ -275,6 +314,7 @@ fn pinToCore(core: u16) !void {
 
 fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !void {
     log.err("Request Parsing {}", .{err});
+    const StatusCode = Response.StatusCode;
     const res = switch (err) {
         error.Internal => Response.fromStatusCode(StatusCode.@"500 Internal Server Error"),
         error.Method => Response.fromStatusCode(StatusCode.@"501 Not Implemented"),
@@ -286,24 +326,34 @@ fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !voi
     try res.write(&writer.interface);
 }
 
-fn handle(arena: std.mem.Allocator, conn: *const net.Server.Connection, paths: *const Trie(Handler)) Request.ParseError!bool {
+fn handleRequest(
+    arena: Allocator,
+    paths: *const Trie(Handler),
+    req: *const Request,
+) Response {
+    if (paths.search(req.path)) |func| {
+        return func(arena, req) catch |err| {
+            log.err("{} in Handler func for path {s}", .{ err, req.path });
+            return Response.internalServerError();
+        };
+    } else {
+        return Response.notFound();
+    }
+}
+
+fn handle(arena: Allocator, conn: *const net.Server.Connection, paths: *const Trie(Handler)) Request.ParseError!bool {
     var buf: [1024 * 8]u8 = undefined;
     var stream_reader = conn.stream.reader(&buf);
     const reader = stream_reader.interface();
 
     var req = try Request.parse(arena, reader);
 
-    for (req.headers.items) |header| {
-        log.debug("{s}: {s}", .{ header.key, header.value });
-    }
-
     var done = false;
     while (!done) {
         done = try req.parseMore(arena, reader);
     }
 
-    const res = if (paths.search(req.path)) |func| func(req) else Response.notFound();
-
+    const res = handleRequest(arena, paths, &req);
     var writer = conn.stream.writer(&buf);
     res.write(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
 

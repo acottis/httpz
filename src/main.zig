@@ -1,6 +1,8 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const http = @import("http.zig");
+const StatusCode = http.Response.StatusCode;
 
 pub fn main() !void {
     var buffer: [1024]u8 = undefined;
@@ -12,7 +14,13 @@ pub fn main() !void {
     try server.listen();
 }
 
-fn foo(req: http.Request) http.Response {
+fn foo(alloc: Allocator, req: *const http.Request) !http.Response {
     std.log.info("From path: {s}", .{req.path});
-    return http.Response.noContent();
+    for (req.headers.items) |header| {
+        std.log.debug("{s}: {s}", .{ header.key, header.value });
+    }
+
+    var res = http.Response.init(StatusCode.@"200 Ok");
+    try res.setHeader(alloc, "Connection", "close");
+    return res;
 }
