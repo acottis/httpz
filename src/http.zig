@@ -21,13 +21,15 @@ const Handler = *const fn (Request) void;
 pub const Server = struct {
     paths: Trie(Handler),
 
+    /// Allocator is only for top level state, allocations to do with
+    /// indidual is handled internally
     pub fn init(allocator: std.mem.Allocator) @This() {
         return .{
             .paths = Trie(Handler).init(allocator),
         };
     }
 
-    pub fn listen(self: *@This()) !void {
+    pub fn listen(self: *const @This()) !void {
         signal.register_handler();
 
         const cores = try std.Thread.getCpuCount();
@@ -47,7 +49,7 @@ pub const Server = struct {
         }
     }
 
-    pub fn add_path(
+    pub fn addPath(
         self: *@This(),
         path: []const u8,
         func: Handler,

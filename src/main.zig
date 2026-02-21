@@ -8,7 +8,7 @@ pub fn main() !void {
     const allocator = fba.allocator();
 
     var server = http.Server.init(allocator);
-    try server.add_path("/foo", foo);
+    try server.addPath("/foo", foo);
     try server.listen();
 }
 
