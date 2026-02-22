@@ -160,8 +160,8 @@ pub const Request = struct {
             try reader.fillMore();
         }
 
-        // Fill the buffer then set readers end to 0 so the next fill will
-        // fill in the first bytes again
+        // Set reader end to 0 so the next fill will fill in the first
+        // bytes again
         const buf = reader.buffered();
         reader.end = 0;
 
@@ -252,7 +252,7 @@ pub const Request = struct {
             return Request.ParseError.ContentTooLarge;
         }
 
-        const bytes = reader.buffer[reader.seek..reader.end];
+        const bytes = reader.buffered();
         reader.end = 0;
 
         try body.appendSlice(arena, bytes);
