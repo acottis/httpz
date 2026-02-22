@@ -146,11 +146,23 @@ pub const Request = struct {
         return true;
     }
 
-    fn parse(arena: Allocator, reader: *std.io.Reader) ParseError!@This() {
+    fn parse(
+        arena: Allocator,
+        reader: *std.io.Reader,
+        mode: *Session.Mode,
+    ) ParseError!@This() {
+        if (mode.* == .detecting) {
+            // Even although we only peek 3 the underlying buffer is
+            // filled as much as possible
+            const magic = try reader.peek(3);
+            mode.* = if (eql(u8, magic, "PRI")) .http2 else .http1;
+        } else {
+            try reader.fillMore();
+        }
+
         // Fill the buffer then set readers end to 0 so the next fill will
         // fill in the first bytes again
-        try reader.fillMore();
-        const buf = reader.buffer[0..reader.end];
+        const buf = reader.buffered();
         reader.end = 0;
 
         var request_parts = splitSequence(u8, buf, "\r\n\r\n");
@@ -331,9 +343,9 @@ pub const Response = struct {
             _ = try writer.write("\r\n");
             try writer.flush();
 
-            const frame = http2.Frame.init(.settings, &.{});
-            try frame.serialise(writer);
-            try writer.flush();
+            // const frame = http2.Frame.init(.settings, &.{});
+            // try frame.serialise(writer);
+            // try writer.flush();
             return;
         }
 
@@ -368,16 +380,22 @@ fn pinToCore(core: u16) !void {
 }
 
 fn handleError(conn: *const net.Server.Connection, err: Error) Writer.Error!void {
-    log.err("Request Parsing {}", .{err});
-
-    switch (err) {
-        Reader.Error.ReadFailed => log.debug("{f} timed out", .{conn.address}),
-        Reader.Error.EndOfStream => log.debug("{f} closed connection", .{conn.address}),
-        Writer.Error.WriteFailed => log.debug("{f} Failed to write to client", .{conn.address}),
-        else => {},
+    // Client disconnect session, not an error for us
+    if (err == Reader.Error.EndOfStream) {
+        log.debug("{f} closed connection", .{conn.address});
+        return;
     }
 
+    log.err("Request Parsing {}", .{err});
     const res = switch (err) {
+        Reader.Error.ReadFailed => {
+            log.debug("{f} timed out", .{conn.address});
+            return;
+        },
+        Writer.Error.WriteFailed => {
+            log.debug("{f} Failed to write to client", .{conn.address});
+            return;
+        },
         error.Internal => Response.init(.@"500 Internal Server Error"),
         error.Method => Response.init(.@"501 Not Implemented"),
         error.Version => Response.init(.@"505 HTTP Version Not Supported"),
@@ -433,7 +451,7 @@ const Session = struct {
         var stream_reader = self.conn.stream.reader(&buf);
         const reader = stream_reader.interface();
 
-        var req = try Request.parse(self.alloc, reader);
+        var req = try Request.parse(self.alloc, reader, &self.mode);
 
         // Handle h2c upgrade
         if (req.connection.upgrade) {
