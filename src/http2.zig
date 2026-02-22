@@ -44,7 +44,6 @@ pub const Frame = struct {
 
     pub fn serialise(self: *const @This(), writer: *std.Io.Writer) !void {
         const len: u24 = @intCast(@sizeOf(Setting) * self.settings.len);
-        std.debug.print("{}, {}\n", .{ len, @sizeOf(Setting) });
         _ = try writer.writeInt(u24, len, big);
         _ = try writer.writeByte(@intFromEnum(self.ty));
         _ = try writer.writeByte(self.flags);

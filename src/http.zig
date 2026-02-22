@@ -6,6 +6,8 @@ const splitSequence = std.mem.splitSequence;
 const stringToEnum = std.meta.stringToEnum;
 const eql = std.mem.eql;
 const Allocator = std.mem.Allocator;
+const Reader = std.Io.Reader;
+const Writer = std.Io.Writer;
 
 const signal = @import("signal.zig");
 const Trie = @import("trie.zig").Trie;
@@ -27,7 +29,7 @@ pub const Server = struct {
 
     /// Allocator is only for top level state, allocations to do with
     /// indidual is handled internally
-    pub fn init(allocator: std.mem.Allocator) @This() {
+    pub fn init(allocator: Allocator) @This() {
         return .{
             .paths = Trie(Handler).init(allocator),
         };
@@ -93,6 +95,8 @@ pub const Header = struct {
     }
 };
 
+const Error = error{} || Request.ParseError || std.Io.Writer.Error;
+
 pub const Request = struct {
     method: Method,
     path: []const u8,
@@ -122,7 +126,7 @@ pub const Request = struct {
         ContentTooLarge,
         /// Server only accepts Smaller Content-Length's
         MaxContentLenExceeded,
-    } || std.mem.Allocator.Error || std.Io.Reader.Error;
+    } || Allocator.Error || Reader.Error;
 
     inline fn complete(self: *@This()) bool {
         if (self.content_len() == 0) return true;
@@ -137,12 +141,12 @@ pub const Request = struct {
     inline fn keepAlive(self: *@This()) bool {
         if (self.connection.close) return false;
 
-        if (self.version == Version.@"HTTP/1.0" and !self.connection.keep_alive) return false;
+        if (self.version == .@"HTTP/1.0" and !self.connection.keep_alive) return false;
 
         return true;
     }
 
-    fn parse(arena: std.mem.Allocator, reader: *std.io.Reader) ParseError!@This() {
+    fn parse(arena: Allocator, reader: *std.io.Reader) ParseError!@This() {
         // Fill the buffer then set readers end to 0 so the next fill will
         // fill in the first bytes again
         try reader.fillMore();
@@ -181,7 +185,7 @@ pub const Request = struct {
                 continue;
             }
             if (eql(u8, key_lower, "connection")) {
-                var tokens = std.mem.splitSequence(u8, value, ", ");
+                var tokens = splitSequence(u8, value, ", ");
                 while (tokens.next()) |token| {
                     _ = std.ascii.lowerString(@constCast(token), token);
 
@@ -223,7 +227,7 @@ pub const Request = struct {
 
     fn parseMore(
         self: *@This(),
-        arena: std.mem.Allocator,
+        arena: Allocator,
         reader: *std.io.Reader,
     ) ParseError!bool {
         if (self.complete()) return true;
@@ -276,8 +280,8 @@ pub const Response = struct {
 
     pub fn h2c() @This() {
         return .{
-            .version = Version.@"HTTP/1.1",
-            .status_code = StatusCode.@"101 Switching Protocols",
+            .version = .@"HTTP/1.1",
+            .status_code = .@"101 Switching Protocols",
             .connection = Connection{ .upgrade = true },
             .headers = std.ArrayList(Header).empty,
         };
@@ -366,8 +370,15 @@ fn pinToCore(core: u16) !void {
     }
 }
 
-fn respondWithError(conn: *const net.Server.Connection, err: Request.ParseError) !void {
+fn handleError(conn: *const net.Server.Connection, err: Error) Writer.Error!void {
     log.err("Request Parsing {}", .{err});
+
+    switch (err) {
+        Reader.Error.ReadFailed => log.debug("{f} timed out", .{conn.address}),
+        Reader.Error.EndOfStream => log.debug("{f} closed connection", .{conn.address}),
+        else => {},
+    }
+
     const res = switch (err) {
         error.Internal => Response.init(.@"500 Internal Server Error"),
         error.Method => Response.init(.@"501 Not Implemented"),
@@ -398,7 +409,7 @@ fn handle(
     arena: Allocator,
     conn: *const net.Server.Connection,
     paths: *const Trie(Handler),
-) Request.ParseError!bool {
+) Error!bool {
     var buf: [1024 * 8]u8 = undefined;
     var stream_reader = conn.stream.reader(&buf);
     const reader = stream_reader.interface();
@@ -409,6 +420,7 @@ fn handle(
         const res = Response.h2c();
         var writer = conn.stream.writer(&buf);
         res.serialise(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
+        try writer.interface.flush();
         return true;
     }
 
@@ -442,27 +454,27 @@ fn worker(id: u16, paths: *const Trie(Handler)) !void {
     defer listener.deinit();
 
     const timeout = posix.timeval{ .sec = 5, .usec = 0 };
+    const timeos = [_]u32{ posix.SO.RCVTIMEO, posix.SO.SNDTIMEO };
+
     while (!signal.RECIEVED) {
         _ = allocator.reset(.retain_capacity);
         const conn = try listener.accept();
         defer conn.stream.close();
         log.info("Received conn: {f}", .{conn.address});
 
-        try posix.setsockopt(
-            conn.stream.handle,
-            posix.SOL.SOCKET,
-            posix.SO.RCVTIMEO,
-            &std.mem.toBytes(timeout),
-        );
+        for (timeos) |timeo| {
+            try posix.setsockopt(
+                conn.stream.handle,
+                posix.SOL.SOCKET,
+                timeo,
+                &std.mem.toBytes(timeout),
+            );
+        }
 
         var keepAlive = true;
         while (keepAlive) {
             keepAlive = handle(arena, &conn, paths) catch |err| {
-                switch (err) {
-                    std.Io.Reader.Error.ReadFailed => log.debug("{f} timed out", .{conn.address}),
-                    std.Io.Reader.Error.EndOfStream => log.debug("{f} closed connection", .{conn.address}),
-                    else => try respondWithError(&conn, err),
-                }
+                try handleError(&conn, err);
                 break;
             };
         }
