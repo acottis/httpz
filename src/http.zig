@@ -146,25 +146,11 @@ pub const Request = struct {
         return true;
     }
 
-    fn parse(
-        arena: Allocator,
-        reader: *std.io.Reader,
-        mode: *Session.Mode,
-    ) ParseError!@This() {
-        if (mode.* == .detecting) {
-            // Even although we only peek 3 the underlying buffer is
-            // filled as much as possible
-            const magic = try reader.peek(3);
-            mode.* = if (eql(u8, magic, "PRI")) .http2 else .http1;
-        } else {
-            try reader.fillMore();
-        }
-
+    fn parseHttp1(alloc: Allocator, reader: *Reader) !@This() {
         // Set reader end to 0 so the next fill will fill in the first
         // bytes again
         const buf = reader.buffered();
         reader.end = 0;
-
         var request_parts = splitSequence(u8, buf, "\r\n\r\n");
         var headers_parts = splitSequence(u8, request_parts.first(), "\r\n");
         const body_slice = request_parts.next() orelse return ParseError.MissingCRLFCRLF;
@@ -176,7 +162,7 @@ pub const Request = struct {
         const version_str = first_line.next() orelse return ParseError.Version;
         const version = stringToEnum(Version, version_str) orelse return ParseError.Version;
 
-        var headers = std.ArrayList(Header).initCapacity(arena, 32) catch return ParseError.Internal;
+        var headers = std.ArrayList(Header).initCapacity(alloc, 32) catch return ParseError.Internal;
 
         var maybe_content_ln: ?u64 = null;
         var connection = Connection{};
@@ -188,7 +174,7 @@ pub const Request = struct {
             const key = header_parts.first();
             const value = header_parts.next() orelse return ParseError.BadHeader;
 
-            const key_lower = try std.ascii.allocLowerString(arena, key);
+            const key_lower = try std.ascii.allocLowerString(alloc, key);
 
             if (eql(u8, key_lower, "content-length")) {
                 maybe_content_ln = std.fmt.parseInt(u64, value, 10) catch return ParseError.HeaderContentLen;
@@ -216,25 +202,50 @@ pub const Request = struct {
                 continue;
             }
 
-            try headers.append(arena, .{ .key = key_lower, .value = try arena.dupe(u8, value) });
+            try headers.append(alloc, .{ .key = key_lower, .value = try alloc.dupe(u8, value) });
         }
 
         var body: ?std.ArrayList(u8) = null;
         if (maybe_content_ln) |content_ln| {
             // Lying about Content Length
             if (body_slice.len > content_ln) return ParseError.Bad;
-            body = try std.ArrayList(u8).initCapacity(arena, content_ln);
-            try body.?.appendSlice(arena, body_slice);
+            body = try std.ArrayList(u8).initCapacity(alloc, content_ln);
+            try body.?.appendSlice(alloc, body_slice);
         }
 
         return .{
             .method = method,
-            .path = try arena.dupe(u8, path),
+            .path = try alloc.dupe(u8, path),
             .version = version,
             .headers = headers,
             .body = body,
             .connection = connection,
         };
+    }
+
+    fn parseHttp2(_: Allocator, _: *Reader) ParseError!@This() {
+        @panic("");
+    }
+
+    fn parse(
+        arena: Allocator,
+        reader: *Reader,
+        mode: *Session.Mode,
+    ) ParseError!@This() {
+        if (mode.* == .detecting) {
+            // Even although we only peek 3 the underlying buffer is
+            // filled as much as possible
+            const magic = try reader.peek(3);
+            mode.* = if (eql(u8, magic, "PRI")) .http2 else .http1;
+        } else {
+            try reader.fillMore();
+        }
+
+        if (mode.* == .http2) {
+            return try parseHttp2(arena, reader);
+        } else {
+            return try parseHttp1(arena, reader);
+        }
     }
 
     fn parseMore(
