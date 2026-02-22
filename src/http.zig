@@ -353,7 +353,11 @@ fn handleRequest(
     }
 }
 
-fn handle(arena: Allocator, conn: *const net.Server.Connection, paths: *const Trie(Handler)) Request.ParseError!bool {
+fn handle(
+    arena: Allocator,
+    conn: *const net.Server.Connection,
+    paths: *const Trie(Handler),
+) Request.ParseError!Connection {
     var buf: [1024 * 8]u8 = undefined;
     var stream_reader = conn.stream.reader(&buf);
     const reader = stream_reader.interface();
@@ -370,7 +374,7 @@ fn handle(arena: Allocator, conn: *const net.Server.Connection, paths: *const Tr
     var writer = conn.stream.writer(&buf);
     res.write(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
 
-    return if (res.connection == Connection.close) false else req.keepAlive();
+    return if (res.connection == Connection.close) Connection.close else req.connection;
 }
 
 fn worker(id: u16, paths: *const Trie(Handler)) !void {
@@ -403,8 +407,8 @@ fn worker(id: u16, paths: *const Trie(Handler)) !void {
             &std.mem.toBytes(timeout),
         );
 
-        var keepAlive = true;
-        while (keepAlive) {
+        var keepAlive = Connection.@"keep-alive";
+        while (keepAlive == Connection.@"keep-alive") {
             keepAlive = handle(arena, &conn, paths) catch |err| {
                 switch (err) {
                     std.Io.Reader.Error.ReadFailed => log.debug("{f} timed out", .{conn.address}),
