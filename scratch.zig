@@ -1,33 +1,46 @@
 const std = @import("std");
 
-const Header = struct {
-    key: []const u8,
-    value: []const u8,
+const Connection = packed struct {
+    KeepAlive: bool = false,
+    Close: bool = false,
+    Upgrade: bool = false,
+    HTTP2Settings: bool = false,
 };
 
 pub fn main() !void {
-    const listener = try std.net.Address.parseIp6("::", 8080);
-    var server = try listener.listen(.{});
-
-    while (true) {
-        const conn = try server.accept();
-        defer conn.stream.close();
-
-        var buf: [8 * 1024]u8 = undefined;
-
-        var stream_reader = conn.stream.reader(&buf);
-        const reader = stream_reader.interface();
-
-        var bread: u64 = 0;
-        while (true) {
-            reader.fillMore() catch break;
-            bread += reader.end;
-            const s = try reader.take(reader.end);
-            std.debug.print("{s}\n", .{s});
-        }
-        std.debug.print("{}\n", .{bread});
-    }
+    var c = Connection{};
+    c.Close = true;
+    std.debug.print("{}\n", .{c});
 }
+
+// const Header = struct {
+//     key: []const u8,
+//     value: []const u8,
+// };
+
+// pub fn main() !void {
+//     const listener = try std.net.Address.parseIp6("::", 8080);
+//     var server = try listener.listen(.{});
+
+//     while (true) {
+//         const conn = try server.accept();
+//         defer conn.stream.close();
+
+//         var buf: [8 * 1024]u8 = undefined;
+
+//         var stream_reader = conn.stream.reader(&buf);
+//         const reader = stream_reader.interface();
+
+//         var bread: u64 = 0;
+//         while (true) {
+//             reader.fillMore() catch break;
+//             bread += reader.end;
+//             const s = try reader.take(reader.end);
+//             std.debug.print("{s}\n", .{s});
+//         }
+//         std.debug.print("{}\n", .{bread});
+//     }
+// }
 
 // const file = try std.fs.cwd().openFile("foo.txt", .{});
 

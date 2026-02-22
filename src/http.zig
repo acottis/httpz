@@ -8,8 +8,8 @@ const splitSequence = std.mem.splitSequence;
 const stringToEnum = std.meta.stringToEnum;
 const Allocator = std.mem.Allocator;
 
-const THREADS = 1;
-// 500 MBs
+const THREADS = 2;
+// 500 MBs - Arbitory limit
 const MAX_CONTENT_LEN = 1024 * 1024 * 500;
 
 const c = @cImport({
@@ -70,9 +70,12 @@ const Version = enum {
     @"HTTP/2.0",
 };
 
-const Connection = enum {
-    close,
-    @"keep-alive",
+const Connection = packed struct {
+    keep_alive: bool = false,
+    /// Close has priority over KeepAlive
+    close: bool = false,
+    upgrade: bool = false,
+    http2_settings: bool = false,
 };
 
 pub const Header = struct {
@@ -129,10 +132,11 @@ pub const Request = struct {
     }
 
     inline fn keepAlive(self: *@This()) bool {
-        return switch (self.connection) {
-            Connection.@"keep-alive" => true,
-            Connection.close => false,
-        };
+        if (self.connection.close) return false;
+
+        if (self.version == Version.@"HTTP/1.0" and !self.connection.keep_alive) return false;
+
+        return true;
     }
 
     fn parse(arena: std.mem.Allocator, reader: *std.io.Reader) ParseError!@This() {
@@ -156,14 +160,13 @@ pub const Request = struct {
         var headers = std.ArrayList(Header).initCapacity(arena, 32) catch return ParseError.Internal;
 
         var maybe_content_ln: ?u64 = null;
-        var connection: Connection = if (version != Version.@"HTTP/1.0") Connection.@"keep-alive" else Connection.close;
+        var connection = Connection{};
 
         // TODO: Maybe move the specific key checkouts out
         while (headers_parts.next()) |header| {
             var header_parts = splitSequence(u8, header, ": ");
 
             const key = header_parts.first();
-
             const value = header_parts.next() orelse return ParseError.BadHeader;
 
             const key_lower = try std.ascii.allocLowerString(arena, key);
@@ -175,7 +178,18 @@ pub const Request = struct {
                 continue;
             }
             if (std.mem.eql(u8, key_lower, "connection")) {
-                connection = stringToEnum(Connection, value) orelse return ParseError.HeaderConnection;
+                var tokens = std.mem.splitSequence(u8, value, ", ");
+                while (tokens.next()) |token| {
+                    if (std.ascii.eqlIgnoreCase(token, "close")) {
+                        connection.close = true;
+                    } else if (std.ascii.eqlIgnoreCase(token, "keep-alive")) {
+                        connection.keep_alive = true;
+                    } else if (std.ascii.eqlIgnoreCase(token, "upgrade")) {
+                        connection.upgrade = true;
+                    } else if (std.ascii.eqlIgnoreCase(token, "http2-settings")) {
+                        connection.http2_settings = true;
+                    }
+                }
                 continue;
             }
 
@@ -247,7 +261,7 @@ pub const Response = struct {
         return .{
             .version = Version.@"HTTP/1.1",
             .status_code = status_code,
-            .connection = Connection.@"keep-alive",
+            .connection = Connection{},
             .headers = std.ArrayList(Header).empty,
             .body = null,
         };
@@ -296,7 +310,7 @@ pub const Response = struct {
 
         const content_len = if (self.body) |b| b.items.len else 0;
         try writer.print("Content-Length: {}\r\n", .{content_len});
-        if (self.connection == Connection.close) {
+        if (self.connection.close) {
             _ = try writer.write("Connection: close\r\n");
         }
         for (self.headers.items) |header| {
@@ -357,7 +371,7 @@ fn handle(
     arena: Allocator,
     conn: *const net.Server.Connection,
     paths: *const Trie(Handler),
-) Request.ParseError!Connection {
+) Request.ParseError!bool {
     var buf: [1024 * 8]u8 = undefined;
     var stream_reader = conn.stream.reader(&buf);
     const reader = stream_reader.interface();
@@ -374,7 +388,7 @@ fn handle(
     var writer = conn.stream.writer(&buf);
     res.write(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
 
-    return if (res.connection == Connection.close) Connection.close else req.connection;
+    return if (res.connection.close) true else req.keepAlive();
 }
 
 fn worker(id: u16, paths: *const Trie(Handler)) !void {
@@ -407,8 +421,8 @@ fn worker(id: u16, paths: *const Trie(Handler)) !void {
             &std.mem.toBytes(timeout),
         );
 
-        var keepAlive = Connection.@"keep-alive";
-        while (keepAlive == Connection.@"keep-alive") {
+        var keepAlive = true;
+        while (keepAlive) {
             keepAlive = handle(arena, &conn, paths) catch |err| {
                 switch (err) {
                     std.Io.Reader.Error.ReadFailed => log.debug("{f} timed out", .{conn.address}),
