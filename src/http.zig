@@ -310,10 +310,6 @@ pub const Response = struct {
         return init(.@"204 No Content");
     }
 
-    pub inline fn badRequest() @This() {
-        return init(.@"400 Bad Request");
-    }
-
     pub inline fn notFound() @This() {
         return init(.@"404 Not Found");
     }
@@ -377,6 +373,7 @@ fn handleError(conn: *const net.Server.Connection, err: Error) Writer.Error!void
     switch (err) {
         Reader.Error.ReadFailed => log.debug("{f} timed out", .{conn.address}),
         Reader.Error.EndOfStream => log.debug("{f} closed connection", .{conn.address}),
+        Writer.Error.WriteFailed => log.debug("{f} Failed to write to client", .{conn.address}),
         else => {},
     }
 
@@ -384,7 +381,7 @@ fn handleError(conn: *const net.Server.Connection, err: Error) Writer.Error!void
         error.Internal => Response.init(.@"500 Internal Server Error"),
         error.Method => Response.init(.@"501 Not Implemented"),
         error.Version => Response.init(.@"505 HTTP Version Not Supported"),
-        else => Response.badRequest(),
+        else => Response.init(.@"400 Bad Request"),
     };
     var buf: [1024]u8 = undefined;
     var writer = conn.stream.writer(&buf);
@@ -442,7 +439,7 @@ const Session = struct {
         if (req.connection.upgrade) {
             const res = Response.h2c();
             var writer = self.conn.stream.writer(&buf);
-            res.serialise(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
+            try res.serialise(&writer.interface);
             try writer.interface.flush();
             return;
         }
@@ -455,7 +452,7 @@ const Session = struct {
         const res = handleRequest(self.alloc, self.paths, &req);
 
         var writer = self.conn.stream.writer(&buf);
-        res.serialise(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
+        try res.serialise(&writer.interface);
 
         self.keep_alive = if (res.connection.close) true else req.keepAlive();
     }
