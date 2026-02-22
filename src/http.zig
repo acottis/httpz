@@ -333,8 +333,9 @@ pub const Response = struct {
             _ = try writer.write("Connection: Upgrade\r\n");
             _ = try writer.write("Upgrade: h2c\r\n");
             _ = try writer.write("\r\n");
+            try writer.flush();
 
-            const frame = http2.Frame.init(.SETTINGS, &.{});
+            const frame = http2.Frame.init(.settings, &.{});
             try frame.serialise(writer);
             try writer.flush();
             return;
@@ -405,37 +406,60 @@ fn handleRequest(
     }
 }
 
-fn handle(
-    arena: Allocator,
+const Session = struct {
+    alloc: Allocator,
     conn: *const net.Server.Connection,
+    mode: Mode = .detecting,
     paths: *const Trie(Handler),
-) Error!bool {
-    var buf: [1024 * 8]u8 = undefined;
-    var stream_reader = conn.stream.reader(&buf);
-    const reader = stream_reader.interface();
+    keep_alive: bool = true,
 
-    var req = try Request.parse(arena, reader);
-    // Handle h2c upgrade
-    if (req.connection.upgrade) {
-        const res = Response.h2c();
-        var writer = conn.stream.writer(&buf);
+    const Mode = enum {
+        detecting,
+        http1,
+        http2,
+    };
+
+    fn init(
+        alloc: Allocator,
+        conn: *const net.Server.Connection,
+        paths: *const Trie(Handler),
+    ) @This() {
+        return .{
+            .alloc = alloc,
+            .conn = conn,
+            .paths = paths,
+        };
+    }
+
+    fn handle(self: *@This()) Error!void {
+        var buf: [1024 * 8]u8 = undefined;
+        var stream_reader = self.conn.stream.reader(&buf);
+        const reader = stream_reader.interface();
+
+        var req = try Request.parse(self.alloc, reader);
+
+        // Handle h2c upgrade
+        if (req.connection.upgrade) {
+            const res = Response.h2c();
+            var writer = self.conn.stream.writer(&buf);
+            res.serialise(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
+            try writer.interface.flush();
+            return;
+        }
+
+        var done = false;
+        while (!done) {
+            done = try req.parseMore(self.alloc, reader);
+        }
+
+        const res = handleRequest(self.alloc, self.paths, &req);
+
+        var writer = self.conn.stream.writer(&buf);
         res.serialise(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
-        try writer.interface.flush();
-        return true;
+
+        self.keep_alive = if (res.connection.close) true else req.keepAlive();
     }
-
-    var done = false;
-    while (!done) {
-        done = try req.parseMore(arena, reader);
-    }
-
-    const res = handleRequest(arena, paths, &req);
-
-    var writer = conn.stream.writer(&buf);
-    res.serialise(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
-
-    return if (res.connection.close) true else req.keepAlive();
-}
+};
 
 fn worker(id: u16, paths: *const Trie(Handler)) !void {
     log.info("Starting worker {}", .{id});
@@ -471,9 +495,9 @@ fn worker(id: u16, paths: *const Trie(Handler)) !void {
             );
         }
 
-        var keepAlive = true;
-        while (keepAlive) {
-            keepAlive = handle(arena, &conn, paths) catch |err| {
+        var session = Session.init(arena, &conn, paths);
+        while (session.keep_alive) {
+            session.handle() catch |err| {
                 try handleError(&conn, err);
                 break;
             };

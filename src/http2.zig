@@ -5,12 +5,12 @@ pub const Setting = struct {
     value: u32,
 
     const Id = enum(u16) {
-        HEADER_TABLE_SIZE = 0x1,
-        ENABLE_PUSH = 0x2,
-        MAX_CONCURRENT_STREAMS = 0x3,
-        INITIAL_WINDOW_SIZE = 0x4,
-        MAX_FRAME_SIZE = 0x5,
-        MAX_HEADER_LIST_SIZE = 0x6,
+        header_table_size = 1,
+        enable_push = 2,
+        max_concurrent_streams = 3,
+        initial_window_size = 4,
+        max_frame_size = 5,
+        max_header_list_size = 6,
     };
 };
 
@@ -23,16 +23,16 @@ pub const Frame = struct {
     const big = std.builtin.Endian.big;
 
     const Ty = enum(u8) {
-        DATA = 0,
-        HEADERS = 1,
-        PRIORITY = 2,
-        RST_STREAM = 3,
-        SETTINGS = 4,
-        PUSH_PROMISE = 5,
-        PING = 6,
-        GOAWAY = 7,
-        WINDOW_UPDATE = 8,
-        CONTINUATION = 9,
+        data = 0,
+        headers = 1,
+        priority = 2,
+        rst_stream = 3,
+        settings = 4,
+        push_promise = 5,
+        ping = 6,
+        goaway = 7,
+        window_update = 8,
+        continuation = 9,
     };
 
     pub fn init(ty: Ty, settings: []const Setting) @This() {
