@@ -180,14 +180,18 @@ pub const Request = struct {
             if (std.mem.eql(u8, key_lower, "connection")) {
                 var tokens = std.mem.splitSequence(u8, value, ", ");
                 while (tokens.next()) |token| {
-                    if (std.ascii.eqlIgnoreCase(token, "close")) {
+                    _ = std.ascii.lowerString(@constCast(token), token);
+
+                    if (std.mem.eql(u8, token, "close")) {
                         connection.close = true;
                     } else if (std.ascii.eqlIgnoreCase(token, "keep-alive")) {
                         connection.keep_alive = true;
-                    } else if (std.ascii.eqlIgnoreCase(token, "upgrade")) {
+                    } else if (std.mem.eql(u8, token, "upgrade")) {
                         connection.upgrade = true;
-                    } else if (std.ascii.eqlIgnoreCase(token, "http2-settings")) {
+                    } else if (std.mem.eql(u8, token, "http2-settings")) {
                         connection.http2_settings = true;
+                    } else {
+                        log.warn("Unhandled connection token: {s}", .{token});
                     }
                 }
                 continue;
