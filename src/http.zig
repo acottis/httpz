@@ -1,12 +1,13 @@
 const std = @import("std");
-const signal = @import("signal.zig");
-const Trie = @import("trie.zig").Trie;
 const net = std.net;
 const log = std.log;
 const posix = std.posix;
 const splitSequence = std.mem.splitSequence;
 const stringToEnum = std.meta.stringToEnum;
 const Allocator = std.mem.Allocator;
+
+const signal = @import("signal.zig");
+const Trie = @import("trie.zig").Trie;
 
 const THREADS = 2;
 // 500 MBs - Arbitory limit
@@ -247,9 +248,10 @@ pub const Response = struct {
     status_code: StatusCode,
     connection: Connection,
     headers: std.ArrayList(Header),
-    body: ?std.ArrayList(u8),
+    body: ?std.ArrayList(u8) = null,
 
     pub const StatusCode = enum {
+        @"101 Switching Protocols",
         @"200 Ok",
         @"204 No Content",
         @"400 Bad Request",
@@ -267,7 +269,15 @@ pub const Response = struct {
             .status_code = status_code,
             .connection = Connection{},
             .headers = std.ArrayList(Header).empty,
-            .body = null,
+        };
+    }
+
+    pub fn h2c() @This() {
+        return .{
+            .version = Version.@"HTTP/1.1",
+            .status_code = StatusCode.@"101 Switching Protocols",
+            .connection = Connection{ .upgrade = true },
+            .headers = std.ArrayList(Header).empty,
         };
     }
 
@@ -311,6 +321,14 @@ pub const Response = struct {
             @tagName(self.version),
             @tagName(self.status_code),
         });
+
+        // Early exit if upgrading
+        if (self.connection.upgrade) {
+            _ = try writer.write("Connection: Upgrade\r\n");
+            _ = try writer.write("Upgrade: h2c\r\n");
+            try writer.flush();
+            return;
+        }
 
         const content_len = if (self.body) |b| b.items.len else 0;
         try writer.print("Content-Length: {}\r\n", .{content_len});
@@ -381,6 +399,13 @@ fn handle(
     const reader = stream_reader.interface();
 
     var req = try Request.parse(arena, reader);
+    // Handle h2c upgrade
+    if (req.connection.upgrade) {
+        const res = Response.h2c();
+        var writer = conn.stream.writer(&buf);
+        res.write(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
+        return true;
+    }
 
     var done = false;
     while (!done) {
