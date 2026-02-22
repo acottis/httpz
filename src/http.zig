@@ -4,10 +4,12 @@ const log = std.log;
 const posix = std.posix;
 const splitSequence = std.mem.splitSequence;
 const stringToEnum = std.meta.stringToEnum;
+const eql = std.mem.eql;
 const Allocator = std.mem.Allocator;
 
 const signal = @import("signal.zig");
 const Trie = @import("trie.zig").Trie;
+const http2 = @import("http2.zig");
 
 const THREADS = 2;
 // 500 MBs - Arbitory limit
@@ -149,7 +151,7 @@ pub const Request = struct {
 
         var request_parts = splitSequence(u8, buf, "\r\n\r\n");
         var headers_parts = splitSequence(u8, request_parts.first(), "\r\n");
-        const body_slice = request_parts.next() orelse return error.MissingCRLFCRLF;
+        const body_slice = request_parts.next() orelse return ParseError.MissingCRLFCRLF;
 
         var first_line = splitSequence(u8, headers_parts.first(), " ");
 
@@ -172,24 +174,24 @@ pub const Request = struct {
 
             const key_lower = try std.ascii.allocLowerString(arena, key);
 
-            if (std.mem.eql(u8, key_lower, "content-length")) {
+            if (eql(u8, key_lower, "content-length")) {
                 maybe_content_ln = std.fmt.parseInt(u64, value, 10) catch return ParseError.HeaderContentLen;
 
                 if (maybe_content_ln.? > MAX_CONTENT_LEN) return ParseError.MaxContentLenExceeded;
                 continue;
             }
-            if (std.mem.eql(u8, key_lower, "connection")) {
+            if (eql(u8, key_lower, "connection")) {
                 var tokens = std.mem.splitSequence(u8, value, ", ");
                 while (tokens.next()) |token| {
                     _ = std.ascii.lowerString(@constCast(token), token);
 
-                    if (std.mem.eql(u8, token, "close")) {
+                    if (eql(u8, token, "close")) {
                         connection.close = true;
                     } else if (std.ascii.eqlIgnoreCase(token, "keep-alive")) {
                         connection.keep_alive = true;
-                    } else if (std.mem.eql(u8, token, "upgrade")) {
+                    } else if (eql(u8, token, "upgrade")) {
                         connection.upgrade = true;
-                    } else if (std.mem.eql(u8, token, "http2-settings")) {
+                    } else if (eql(u8, token, "http2-settings")) {
                         connection.http2_settings = true;
                     } else {
                         log.warn("Unhandled connection token: {s}", .{token});
@@ -265,7 +267,7 @@ pub const Response = struct {
         status_code: StatusCode,
     ) @This() {
         return .{
-            .version = Version.@"HTTP/1.1",
+            .version = .@"HTTP/1.1",
             .status_code = status_code,
             .connection = Connection{},
             .headers = std.ArrayList(Header).empty,
@@ -297,26 +299,26 @@ pub const Response = struct {
     }
 
     pub fn close(self: *@This()) void {
-        self.connection = Connection.close;
+        self.connection = .close;
     }
 
     pub inline fn noContent() @This() {
-        return init(StatusCode.@"204 No Content");
+        return init(.@"204 No Content");
     }
 
     pub inline fn badRequest() @This() {
-        return init(StatusCode.@"400 Bad Request");
+        return init(.@"400 Bad Request");
     }
 
     pub inline fn notFound() @This() {
-        return init(StatusCode.@"404 Not Found");
+        return init(.@"404 Not Found");
     }
 
     pub inline fn internalServerError() @This() {
-        return init(StatusCode.@"500 Internal Server Error");
+        return init(.@"500 Internal Server Error");
     }
 
-    fn write(self: *const @This(), writer: *std.io.Writer) !void {
+    fn serialise(self: *const @This(), writer: *std.io.Writer) !void {
         try writer.print("{s} {s}\r\n", .{
             @tagName(self.version),
             @tagName(self.status_code),
@@ -326,6 +328,10 @@ pub const Response = struct {
         if (self.connection.upgrade) {
             _ = try writer.write("Connection: Upgrade\r\n");
             _ = try writer.write("Upgrade: h2c\r\n");
+            _ = try writer.write("\r\n");
+
+            const frame = http2.Frame.init(.SETTINGS, &.{});
+            try frame.serialise(writer);
             try writer.flush();
             return;
         }
@@ -360,18 +366,17 @@ fn pinToCore(core: u16) !void {
     }
 }
 
-fn handleError(conn: *const net.Server.Connection, err: Request.ParseError) !void {
+fn respondWithError(conn: *const net.Server.Connection, err: Request.ParseError) !void {
     log.err("Request Parsing {}", .{err});
-    const StatusCode = Response.StatusCode;
     const res = switch (err) {
-        error.Internal => Response.init(StatusCode.@"500 Internal Server Error"),
-        error.Method => Response.init(StatusCode.@"501 Not Implemented"),
-        error.Version => Response.init(StatusCode.@"505 HTTP Version Not Supported"),
+        error.Internal => Response.init(.@"500 Internal Server Error"),
+        error.Method => Response.init(.@"501 Not Implemented"),
+        error.Version => Response.init(.@"505 HTTP Version Not Supported"),
         else => Response.badRequest(),
     };
     var buf: [1024]u8 = undefined;
     var writer = conn.stream.writer(&buf);
-    try res.write(&writer.interface);
+    try res.serialise(&writer.interface);
 }
 
 fn handleRequest(
@@ -403,7 +408,7 @@ fn handle(
     if (req.connection.upgrade) {
         const res = Response.h2c();
         var writer = conn.stream.writer(&buf);
-        res.write(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
+        res.serialise(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
         return true;
     }
 
@@ -415,7 +420,7 @@ fn handle(
     const res = handleRequest(arena, paths, &req);
 
     var writer = conn.stream.writer(&buf);
-    res.write(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
+    res.serialise(&writer.interface) catch |err| log.err("Failed to respond {}", .{err});
 
     return if (res.connection.close) true else req.keepAlive();
 }
@@ -456,7 +461,7 @@ fn worker(id: u16, paths: *const Trie(Handler)) !void {
                 switch (err) {
                     std.Io.Reader.Error.ReadFailed => log.debug("{f} timed out", .{conn.address}),
                     std.Io.Reader.Error.EndOfStream => log.debug("{f} closed connection", .{conn.address}),
-                    else => try handleError(&conn, err),
+                    else => try respondWithError(&conn, err),
                 }
                 break;
             };
