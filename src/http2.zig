@@ -14,11 +14,20 @@ pub const Setting = struct {
     };
 };
 
+// TODO: Half implemented
+pub const Headers = struct {
+    pub fn parse(reader: *std.Io.Reader) @This() {
+        const b = reader.takeByte();
+        std.debug.print("{any}\n", .{b});
+        return .{};
+    }
+};
+
 pub const Frame = struct {
     ty: Ty,
     flags: u8 = 0,
-    stream: u31 = 0,
-    settings: []const Setting,
+    stream: u31,
+    payload: []const u8,
 
     const big = std.builtin.Endian.big;
 
@@ -39,6 +48,24 @@ pub const Frame = struct {
         return .{
             .ty = ty,
             .settings = settings,
+        };
+    }
+
+    pub fn parse(reader: *std.Io.Reader) !@This() {
+        const len = try reader.takeInt(u24, std.builtin.Endian.big);
+        const ty = try reader.takeByte();
+        const flags = try reader.takeByte();
+        const stream = try reader.takeInt(u32, std.builtin.Endian.big);
+
+        const payload = reader.buffer[reader.seek .. reader.seek + len];
+        // TODO: Parse Payloads
+        reader.toss(len);
+
+        return .{
+            .ty = @enumFromInt(ty),
+            .flags = flags,
+            .stream = @intCast(stream),
+            .payload = payload,
         };
     }
 

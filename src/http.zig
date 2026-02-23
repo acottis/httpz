@@ -147,9 +147,9 @@ pub const Request = struct {
     }
 
     fn parseHttp1(alloc: Allocator, reader: *Reader) !@This() {
-        // Set reader end to 0 so the next fill will fill in the first
-        // bytes again
         const buf = reader.buffered();
+        // Set reader end to 0 so the next fill will fill in the first
+        // bytes again on next fill
         reader.end = 0;
         var request_parts = splitSequence(u8, buf, "\r\n\r\n");
         var headers_parts = splitSequence(u8, request_parts.first(), "\r\n");
@@ -223,8 +223,28 @@ pub const Request = struct {
         };
     }
 
-    fn parseHttp2(_: Allocator, _: *Reader) ParseError!@This() {
+    // TODO: Half implemented
+    fn parseHttp2(_: Allocator, reader: *Reader) ParseError!@This() {
+
+        // Skip magic
+        reader.toss(24);
+        while (reader.bufferedLen() > 9) {
+            const frame = try http2.Frame.parse(reader);
+            if (frame.ty == .headers) {
+                var r = std.Io.Reader.fixed(@constCast(frame.payload));
+                _ = http2.Headers.parse(&r);
+            }
+        }
         @panic("");
+
+        // return .{
+        //     .method = .GET,
+        //     .path = "",
+        //     .version = .@"HTTP/2.0",
+        //     .headers = std.ArrayList(Header).empty,
+        //     .body = null,
+        //     .connection = Connection{},
+        // };
     }
 
     fn parse(
