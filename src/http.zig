@@ -35,7 +35,7 @@ pub const Server = struct {
         };
     }
 
-    pub fn listen(self: *const @This()) !void {
+    pub fn listen(self: *const @This(), port: u16) !void {
         signal.register_handler();
 
         const cores = try std.Thread.getCpuCount();
@@ -45,6 +45,7 @@ pub const Server = struct {
             const id: u8 = @intCast(i);
             threads[i] = try std.Thread.spawn(.{}, worker, .{
                 id,
+                port,
                 &self.paths,
             });
         }
@@ -507,8 +508,8 @@ const Session = struct {
     }
 };
 
-fn worker(id: u16, paths: *const Trie(Handler)) !void {
-    log.info("Starting worker {}", .{id});
+fn worker(id: u16, port: u16, paths: *const Trie(Handler)) !void {
+    log.info("Starting worker {} on port {}", .{ id, port });
 
     // Prevent allocating to a core we dont have
     const max_cores = try std.Thread.getCpuCount();
@@ -517,7 +518,7 @@ fn worker(id: u16, paths: *const Trie(Handler)) !void {
     var allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const arena = allocator.allocator();
 
-    const address = net.Address.initIp6(comptime [_]u8{0} ** 16, 8080, 0, 0);
+    const address = net.Address.initIp6(comptime [_]u8{0} ** 16, port, 0, 0);
     const options = net.Address.ListenOptions{ .reuse_address = true };
 
     var listener = try address.listen(options);

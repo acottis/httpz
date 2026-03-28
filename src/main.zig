@@ -11,7 +11,7 @@ pub fn main() !void {
 
     var server = http.Server.init(allocator);
     try server.addPath("/foo", foo);
-    try server.listen();
+    try server.listen(8080);
 }
 
 fn foo(alloc: Allocator, req: *const http.Request) !http.Response {
